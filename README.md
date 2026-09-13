@@ -27,6 +27,10 @@ and click *Apply changes*.
 
 Don't combine it with other Twitch-specific ad blockers.
 
+**Stay up to date.** Every script update is published as a [release](https://github.com/Nello1717/TwitchAdBlock/releases).
+To be notified, click *Watch* > *Custom* > *Releases* on this repository. Userscript managers update on their own;
+uBlock Origin users can copy the address pinned in each release's notes into `userResourcesLocation`.
+
 ## Why other scripts end up in low quality
 
 These observations come from live twitch.tv playlists (September 2026):
@@ -143,6 +147,10 @@ npm run build   # regenerate twitch-adblock-hq-ublock-origin.js from the userscr
 - `tests/fake-twitch.js` models Twitch's per-session ads, session-relative numbering and live sequence tags. The
   integration tests check that every playlist the player receives is ad-free and continuous: no reused sequence
   numbers, no repeated or skipped content.
+- Pushing a change to either script on `main` runs the tests and publishes a release
+  ([release workflow](.github/workflows/release.yml)). Releases are named after `@version`, so bump it together with
+  `VERSION` in the script; a change without a bump is still released (e.g. `v1.1.2-r7`) but userscript managers won't
+  offer it. Preview the release notes with `node tools/release-info.js`.
 
 ## Credits
 

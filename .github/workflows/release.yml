@@ -1,0 +1,53 @@
+name: Release
+
+# Publishes a GitHub release whenever a pushed commit adds or changes a script, so users can follow updates with
+# Watch > Custom > Releases. Can also be started manually from the Actions tab.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - twitch-adblock-hq.user.js
+      - twitch-adblock-hq-ublock-origin.js
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Test and publish release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history and tags, for release notes and version checks
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Run tests
+        run: npm test # also fails if the uBlock Origin file wasn't rebuilt
+
+      - name: Prepare release
+        id: release
+        run: node tools/release-info.js
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.release.outputs.tag }}" \
+            twitch-adblock-hq.user.js \
+            twitch-adblock-hq-ublock-origin.js \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.release.outputs.title }}" \
+            --notes-file "${{ steps.release.outputs.notes_file }}"
