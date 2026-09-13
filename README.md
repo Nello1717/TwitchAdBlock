@@ -22,7 +22,7 @@ On Chromium browsers with Manifest V3 userscript managers, enable *Allow user sc
 4. Restart the browser.
 
 uBlock Origin keeps its downloaded copy of the script until the address changes; restarting or "Update now" doesn't
-refresh it. To get a new version, add or change a version suffix at the end of the address, e.g. `...ublock-origin.js?v=1.1.2`,
+refresh it. To get a new version, add or change a version suffix at the end of the address, e.g. `...ublock-origin.js?v=1.1.3`,
 and click *Apply changes*.
 
 Don't combine it with other Twitch-specific ad blockers.
@@ -68,6 +68,8 @@ These observations come from live twitch.tv playlists (September 2026):
    setting decides what happens:
    - `hold` (default): never lower the quality. The player waits behind a notice while the script keeps checking.
      As soon as your session or a backup is ad-free at your quality, playback continues at the live edge.
+     Twitch's player sometimes stays stopped after such a wait, behind its OFFLINE screen. The script notices, starts
+     it again and, if that doesn't help within about 12 seconds, reloads the player on the same session (no new ad).
    - `lowres`: show the best lower-quality ad-free stream (usually 360p). Switch back to your quality the moment
      any session offers it ad-free.
 
@@ -126,14 +128,15 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 
 ## Troubleshooting
 
-- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.2 active`. With `debug: true` it also logs
+- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.3 active`. With `debug: true` it also logs
   `worker hooks installed` when a stream loads.
 - **Try the ad path without waiting for an ad:** `twitchAdBlockHQ.simulateAd(30)` pretends your session shows a
   30-second ad. `twitchAdBlockHQ.simulateAd(30, true)` pretends full-quality backups do too, which exercises
   `hold` / `lowres`.
 - `twitchAdBlockHQ.status()` returns the latest state (mode, quality, backup in use).
 - **Playback problems:** run `twitchAdBlockHQ.diagnostics()` while it happens. It prints the player state, every
-  video element (frames, dropped frames, buffer), the playback rate of the last minute and the script's recent actions.
+  video element (frames, dropped frames, buffer), the playback rate of the last minute and the script's recent actions,
+  including any automatic restarts or reloads of the player.
 
 ## Development
 

@@ -18,7 +18,7 @@ twitch-videoad.js text/javascript
 (function (root) {
     'use strict';
     if (/(^|\.)twitch\.tv$/.test(document.location.hostname) === false) { return; }
-    const VERSION = '1.1.2';
+    const VERSION = '1.1.3';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
     const DEFAULT_SETTINGS = {
@@ -1114,6 +1114,9 @@ twitch-videoad.js text/javascript
         if (!previous || previous.mode !== status.mode || previous.source !== status.source) {
             note('status', { mode: status.mode, quality: status.quality, source: status.source, sourceQuality: status.sourceQuality });
         }
+        if (status.adActive) {
+            armPlaybackRecovery();
+        }
         if (status.mode === 'hold') {
             if (!hold) {
                 const video = findVideo();
@@ -1382,17 +1385,22 @@ twitch-videoad.js text/javascript
             }
         }, 500);
     }
-    // The main stream's player. Twitch can have several (e.g. a preview), so prefer the one whose video is largest on screen.
-    let cachedPlayer = null;
-    let cachedPlayerAt = 0;
+    // Twitch's React components for the stream: the media player, and the component that loads the player's source
+    // (used to reload it). Twitch can have several players (e.g. a preview), so prefer the one whose video is largest.
+    let cachedComponents = null;
+    let cachedComponentsAt = 0;
     function findMediaPlayer() {
-        if (cachedPlayer && Date.now() - cachedPlayerAt < 2000) return cachedPlayer;
+        return findPlayerComponents().player;
+    }
+    function findPlayerComponents() {
+        if (cachedComponents && Date.now() - cachedComponentsAt < 2000) return cachedComponents;
         const rootNode = document.querySelector('#root');
-        if (!rootNode) return null;
+        if (!rootNode) return { player: null, loader: null };
         const containerKey = Object.keys(rootNode).find((key) => key.startsWith('__reactContainer'));
         let fiber = containerKey ? rootNode[containerKey] : rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current;
         const stack = fiber ? [fiber] : [];
         const candidates = [];
+        let loader = null;
         let visited = 0;
         while (stack.length && visited++ < 50000) {
             fiber = stack.pop();
@@ -1401,6 +1409,9 @@ twitch-videoad.js text/javascript
                 const instance = node.props.mediaPlayerInstance;
                 const player = instance.playerInstance || instance;
                 if (!candidates.includes(player)) candidates.push(player);
+            }
+            if (!loader && node && typeof node.setSrc === 'function' && node.setInitialPlaybackSettings) {
+                loader = node;
             }
             if (fiber.sibling) stack.push(fiber.sibling);
             if (fiber.child) stack.push(fiber.child);
@@ -1414,9 +1425,89 @@ twitch-videoad.js text/javascript
             }
         };
         candidates.sort((a, b) => area(b) - area(a));
-        cachedPlayer = candidates[0] || null;
-        cachedPlayerAt = Date.now();
-        return cachedPlayer;
+        cachedComponents = { player: candidates[0] || null, loader };
+        cachedComponentsAt = Date.now();
+        return cachedComponents;
+    }
+    // Reloads the player the way Twitch does when switching streams: a fresh player without any leftover errors.
+    // Without newSession it keeps the current playback session, so no new preroll is requested.
+    function reloadPlayer(reason, newSession) {
+        const { player, loader } = findPlayerComponents();
+        if (!loader) {
+            note('could not find the player to reload', { reason });
+            return false;
+        }
+        note('reloading the player', { reason, newSession: !!newSession });
+        cachedComponents = null;
+        loader.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: !!newSession });
+        if (player && typeof player.play === 'function') player.play();
+        return true;
+    }
+    // After an ad, Twitch's player can stop for good: paused behind its OFFLINE screen while the stream is live, where
+    // play() no longer helps. While ads are being handled (and for a while after), watch for playback that should be
+    // running but isn't: start the player again, then reload it. Pauses by the viewer are left alone.
+    const recovery = { armedUntil: 0, timer: null, lastTime: -1, lastProgressAt: 0, lastInputAt: 0, viewerPaused: false, plays: 0, reloads: 0, lastReloadAt: 0 };
+    function startPlaybackRecovery() {
+        const markInput = () => { recovery.lastInputAt = Date.now(); };
+        document.addEventListener('pointerdown', markInput, true);
+        document.addEventListener('keydown', markInput, true);
+        document.addEventListener('pause', (event) => {
+            if (event.target instanceof HTMLVideoElement && Date.now() - recovery.lastInputAt < 1500) recovery.viewerPaused = true;
+        }, true);
+        document.addEventListener('play', (event) => {
+            if (event.target instanceof HTMLVideoElement) recovery.viewerPaused = false;
+        }, true);
+    }
+    function armPlaybackRecovery() {
+        const now = Date.now();
+        if (recovery.armedUntil < now) {
+            recovery.plays = 0;
+            recovery.reloads = 0;
+            recovery.lastProgressAt = now;
+        }
+        recovery.armedUntil = now + 10 * 60000;
+        if (!recovery.timer) recovery.timer = setInterval(checkPlaybackRecovery, 1000);
+    }
+    function checkPlaybackRecovery() {
+        const now = Date.now();
+        if (now > recovery.armedUntil) {
+            clearInterval(recovery.timer);
+            recovery.timer = null;
+            return;
+        }
+        const video = findVideo();
+        if (!video) return;
+        const advancing = !video.paused && video.currentTime !== recovery.lastTime;
+        recovery.lastTime = video.currentTime;
+        const waitingOnPurpose = lastStatus && lastStatus.mode === 'hold';
+        if (advancing || waitingOnPurpose || recovery.viewerPaused || document.visibilityState !== 'visible') {
+            if (advancing) {
+                recovery.plays = 0;
+                if (now - recovery.lastReloadAt > 60000) recovery.reloads = 0;
+            }
+            recovery.lastProgressAt = now;
+            return;
+        }
+        const stuckFor = now - recovery.lastProgressAt;
+        if ((stuckFor >= 4000 && recovery.plays === 0) || (stuckFor >= 8000 && recovery.plays === 1)) {
+            recovery.plays++;
+            note('playback stopped; starting the player again', { stuckSeconds: Math.round(stuckFor / 1000) });
+            for (let i = 0; i < video.buffered.length; i++) {
+                const start = video.buffered.start(i);
+                if (start > video.currentTime && start - video.currentTime < 60) {
+                    video.currentTime = start + 0.05;
+                    break;
+                }
+            }
+            resumePlayer();
+        } else if (stuckFor >= 12000 && recovery.reloads < 3 && now - recovery.lastReloadAt > 20000) {
+            recovery.reloads++;
+            recovery.lastReloadAt = now;
+            recovery.plays = 0;
+            recovery.lastProgressAt = now;
+            // First keep the session; if that didn't help (e.g. the session expired), start a new one.
+            reloadPlayer(`playback stopped for ${Math.round(stuckFor / 1000)}s`, recovery.reloads > 1);
+        }
     }
     function diagnostics() {
         const player = findMediaPlayer();
@@ -1464,6 +1555,7 @@ twitch-videoad.js text/javascript
             status: lastStatus,
             player: playerState,
             offlineShown: !!playerElement && playerElement.innerText.includes('OFFLINE'),
+            recovery: { armed: recovery.armedUntil > Date.now(), viewerPaused: recovery.viewerPaused, reloads: recovery.reloads, reloadable: !!findPlayerComponents().loader },
             videos,
             playbackLastMinute: samples.slice(-60).map((s) => `${s.at} ${s.fps}fps dropped:${s.dropped} speed:${s.rate} ${s.height}p${s.paused ? ' paused' : ''}`),
             events: events.slice(-60),
@@ -1508,6 +1600,7 @@ twitch-videoad.js text/javascript
     hookWorker();
     startDisplayAdGuard();
     startPlaybackSampler();
+    startPlaybackRecovery();
     exposeApi();
     console.log(`[TwitchAdBlockHQ] v${VERSION} active (fallback: ${settings.fallbackMode})`);
     if (settings.debug) console.log('[TwitchAdBlockHQ] settings', JSON.stringify(settings));

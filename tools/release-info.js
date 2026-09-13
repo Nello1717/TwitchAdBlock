@@ -11,7 +11,7 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const SCRIPTS = ['twitch-adblock-hq.user.js', 'twitch-adblock-hq-ublock-origin.js'];
-const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8' }).trim();
+const git = (...args) => execFileSync('git', args, { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 const userscript = fs.readFileSync(path.join(root, SCRIPTS[0]), 'utf8');
 const versionMatch = /^\/\/ @version\s+(\S+)/m.exec(userscript);
