@@ -118,7 +118,7 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 
 ## Troubleshooting
 
-- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.0 active`. With `debug: true` it also logs
+- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.1 active`. With `debug: true` it also logs
   `worker hooks installed` when a stream loads.
 - **Try the ad path without waiting for an ad:** `twitchAdBlockHQ.simulateAd(30)` pretends your session shows a
   30-second ad. `twitchAdBlockHQ.simulateAd(30, true)` pretends full-quality backups do too, which exercises

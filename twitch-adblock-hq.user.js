@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch AdBlock HQ
 // @namespace    https://github.com/Nello1717/TwitchAdBlock
-// @version      1.1.0
+// @version      1.1.1
 // @description  Blocks Twitch ads without dropping the stream to low quality
 // @author       Nello
 // @license      MIT
@@ -32,7 +32,7 @@
 (function (root) {
     'use strict';
 
-    const VERSION = '1.1.0';
+    const VERSION = '1.1.1';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
 

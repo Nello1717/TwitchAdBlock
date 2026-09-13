@@ -2,6 +2,10 @@
 
 // Generates the uBlock Origin scriptlet from the userscript, so both stay identical.
 // Usage: npm run build   (or: node tools/build-ublock.js --check to verify it is up to date)
+//
+// uBlock Origin reads userResourcesLocation files line by line: a resource starts with a "name mime" line, lines
+// starting with '#' or '// ' are ignored, and the first whitespace-only line ends the resource. The script body is
+// therefore written without blank lines, and lines uBlock Origin would misread are rejected.
 
 const fs = require('fs');
 const path = require('path');
@@ -18,10 +22,15 @@ const marker = "(function (root) {\n    'use strict';\n";
 if (!body.includes(marker)) {
     throw new Error('script entry point not found');
 }
-const output = 'twitch-videoad.js text/javascript\n' + body.replace(
-    marker,
-    `${marker}    if (/(^|\\.)twitch\\.tv$/.test(document.location.hostname) === false) { return; }\n`,
-);
+const lines = body
+    .replace(marker, `${marker}    if (/(^|\\.)twitch\\.tv$/.test(document.location.hostname) === false) { return; }\n`)
+    .split('\n')
+    .filter((line) => /\S/.test(line));
+const misread = lines.find((line) => line.startsWith('#') || line.startsWith('///'));
+if (misread) {
+    throw new Error(`uBlock Origin would misread this line: ${misread}`);
+}
+const output = `twitch-videoad.js text/javascript\n${lines.join('\n')}\n`;
 
 if (process.argv.includes('--check')) {
     const current = fs.existsSync(target) ? fs.readFileSync(target, 'utf8').replace(/\r\n/g, '\n') : '';

@@ -15,15 +15,12 @@ twitch-videoad.js text/javascript
 //
 // Worker injection and React player lookup are adapted from TwitchAdSolutions
 // (https://github.com/pixeltris/TwitchAdSolutions, MIT License, Copyright (c) 2020-present TwitchAdSolutions Contributors).
-
 (function (root) {
     'use strict';
     if (/(^|\.)twitch\.tv$/.test(document.location.hostname) === false) { return; }
-
-    const VERSION = '1.1.0';
+    const VERSION = '1.1.1';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
-
     const DEFAULT_SETTINGS = {
         // What to play while the player's session shows an ad and no ad-free stream at your quality exists yet:
         //   'hold'   - never lower the quality; the player waits until an ad-free stream at your quality is available
@@ -54,7 +51,6 @@ twitch-videoad.js text/javascript
         // Advanced: override values from TUNING below, e.g. { sessionWaitMs: 2000 }.
         tuning: {},
     };
-
     const TUNING = {
         sessionWaitMs: 3000, // How long a playlist request waits for backup sessions that are still opening
         mediaFetchTimeoutMs: 2500, // Timeout for backup media playlist requests
@@ -72,11 +68,9 @@ twitch-videoad.js text/javascript
         maxHoldMs: 300000, // Stop refreshing on the player's behalf after this long
         holdPauseDelayMs: 1500, // Pause the player this long after a hold starts, before its quality selection reacts
     };
-
     // Public web client values, used until the page's own requests reveal the current ones.
     const DEFAULT_CLIENT_ID = 'kimne78kx3ncx6brgo4mv6wki5h1ko';
     const DEFAULT_TOKEN_HASH = 'ed230aa1e33e07eebb8928504583da78a5173989fadfb1ac94be06a04f3cdbe9';
-
     // -----------------------------------------------------------------------------------------------------------------
     // HLS playlist helpers. Pure functions: injected into the player's Web Worker and covered by the unit tests.
     // -----------------------------------------------------------------------------------------------------------------
@@ -91,7 +85,6 @@ twitch-videoad.js text/javascript
             }
             return attributes;
         }
-
         function codecFamily(codecs) {
             const value = String(codecs || '').toLowerCase();
             if (/(^|,)\s*(hev1|hvc1)/.test(value)) return 'hevc';
@@ -100,7 +93,6 @@ twitch-videoad.js text/javascript
             if (/mp4a/.test(value)) return 'audio';
             return value.split('.')[0] || 'unknown';
         }
-
         function nextUriIndex(lines, start) {
             for (let i = start; i < lines.length; i++) {
                 const line = lines[i].trim();
@@ -110,7 +102,6 @@ twitch-videoad.js text/javascript
             }
             return -1;
         }
-
         function describeVariant(attributes, url) {
             const size = String(attributes.RESOLUTION || '').split('x');
             const width = parseInt(size[0], 10) || 0;
@@ -131,7 +122,6 @@ twitch-videoad.js text/javascript
                 label: height ? `${height}p${fps >= 48 ? fps : ''}` : 'audio only',
             };
         }
-
         function parseMaster(text) {
             const lines = String(text).replace(/\r/g, '').split('\n');
             const variants = [];
@@ -143,11 +133,9 @@ twitch-videoad.js text/javascript
             }
             return variants;
         }
-
         function qualityScore(variant) {
             return variant.height * 1000 + variant.fps;
         }
-
         // Finds the variant of another session to use for `target`: the identical rendition if it exists, otherwise
         // the best rendition that doesn't exceed the target and uses the same codec (the player can't switch codecs).
         function matchVariant(variants, target) {
@@ -165,16 +153,13 @@ twitch-videoad.js text/javascript
             }
             return best ? { variant: best, exact: false } : null;
         }
-
         // URL fragments of ad and placeholder segments, as observed in the field by TwitchAdSolutions.
         // Real segment URLs use a base64url token, so these slash-delimited fragments can't occur in them by chance.
         const AD_SEGMENT_URL_PATTERNS = ['/adsquared/', '/_404/', '/processing'];
-
         // twitch-stitched-ad, twitch-stitched-* variants, twitch-ad-quartile, twitch-maf-ad, ...
         function isAdDateRangeClass(className) {
             return /(^|-)ad(-|$)/.test(className) || className.includes('stitched');
         }
-
         function parseMedia(text, knownSequenceByUri) {
             const lines = String(text).replace(/\r/g, '').split('\n');
             const playlist = {
@@ -252,7 +237,6 @@ twitch-videoad.js text/javascript
             assignGlobalSequence(playlist, knownSequenceByUri);
             return playlist;
         }
-
         // Numbers live segments with the channel-wide sequence. Sessions that showed an ad restart MEDIA-SEQUENCE at 0,
         // but #EXT-X-TWITCH-LIVE-SEQUENCE always holds the channel-wide number of the first live segment.
         function assignGlobalSequence(playlist, knownSequenceByUri) {
@@ -283,7 +267,6 @@ twitch-videoad.js text/javascript
                 gap = false;
             }
         }
-
         function rememberSequence(knownSequenceByUri, playlist) {
             const current = new Set();
             for (const segment of playlist.segments) {
@@ -297,35 +280,29 @@ twitch-videoad.js text/javascript
                 if (!current.has(uri)) knownSequenceByUri.delete(uri);
             }
         }
-
         function hasAdSegments(playlist) {
             return playlist.segments.some((s) => !s.live);
         }
-
         function isShowingAd(playlist) {
             const last = playlist.segments[playlist.segments.length - 1];
             return last ? !last.live : playlist.hasAdMarkers;
         }
-
         function newestLiveSegment(playlist) {
             for (let i = playlist.segments.length - 1; i >= 0; i--) {
                 if (playlist.segments[i].live) return playlist.segments[i];
             }
             return null;
         }
-
         // One timeline per variant playlist the player requests. `virtual` becomes true once the playlist is rewritten.
         function createTimeline() {
             return { segments: [], lastGseq: -1, pdtOffsets: {}, virtual: false, skipToLive: false, heldRefreshes: 0 };
         }
-
         // Sequence numbers shown to the player, shared by every variant of a stream so quality switches stay aligned.
         // They equal the channel-wide sequence until content is skipped (e.g. while holding during an ad); the gap is
         // then closed so the player sees contiguous numbers.
         function createSequenceState() {
             return { offset: 0, offsetSince: -1, lastGseq: -1, lastVseq: -1 };
         }
-
         // Adds live segments newer than the timeline's newest segment. Returns what changed.
         // After a gap only the newest `maxAfterGap` segments are added, so playback resumes close to live.
         function appendToTimeline(timeline, segments, variantKey, sourceId, sequence, maxAfterGap) {
@@ -393,13 +370,11 @@ twitch-videoad.js text/javascript
             }
             return result;
         }
-
         function trimTimeline(timeline, maxSegments) {
             if (timeline.segments.length > maxSegments) {
                 timeline.segments.splice(0, timeline.segments.length - maxSegments);
             }
         }
-
         function renderTimeline(timeline, options) {
             const opts = options || {};
             const segments = timeline.segments;
@@ -432,7 +407,6 @@ twitch-videoad.js text/javascript
             if (opts.endList) lines.push('#EXT-X-ENDLIST');
             return lines.join('\n') + '\n';
         }
-
         return {
             parseAttributes,
             codecFamily,
@@ -451,7 +425,6 @@ twitch-videoad.js text/javascript
             renderTimeline,
         };
     }
-
     // -----------------------------------------------------------------------------------------------------------------
     // Runs inside the player's Web Worker (before Twitch's own worker code). `scope` is the worker global scope.
     // -----------------------------------------------------------------------------------------------------------------
@@ -467,13 +440,11 @@ twitch-videoad.js text/javascript
         const pendingPageFetches = new Map();
         let simulation = { until: 0, includeBackups: false };
         let nextId = 1;
-
         const now = () => Date.now();
         const log = (...args) => {
             if (settings.debug) console.log('[TwitchAdBlockHQ]', ...args);
         };
         const post = (message) => scope.postMessage(Object.assign({ [tag]: true }, message));
-
         scope.addEventListener('message', (event) => {
             const data = event.data;
             if (!data || data[tag] !== true) return;
@@ -494,7 +465,6 @@ twitch-videoad.js text/javascript
                 }
             }
         });
-
         scope.fetch = function (input, options) {
             let url = null;
             try {
@@ -514,22 +484,18 @@ twitch-videoad.js text/javascript
             return realFetch(input, options);
         };
         Object.defineProperty(scope.fetch, 'toString', { value: () => 'function fetch() { [native code] }', configurable: true });
-
         function isUsherUrl(url) {
             return /\/channel\/hls\/[^/?]+\.m3u8/.test(url) && !url.includes('picture-by-picture');
         }
-
         function playlistResponse(text) {
             return new Response(text, { status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } });
         }
-
         function withTimeout(promise, ms) {
             return new Promise((resolve) => {
                 const timer = setTimeout(() => resolve(null), ms);
                 promise.then((value) => { clearTimeout(timer); resolve(value); }, () => { clearTimeout(timer); resolve(null); });
             });
         }
-
         function pageFetch(url, options) {
             return new Promise((resolve) => {
                 const id = nextId++;
@@ -544,7 +510,6 @@ twitch-videoad.js text/javascript
                 post({ type: 'page-fetch', id, url, options });
             });
         }
-
         async function handleMaster(url, input, options) {
             let requestUrl = url;
             if (settings.forcePlayerType) {
@@ -565,7 +530,6 @@ twitch-videoad.js text/javascript
             }
             return playlistResponse(text);
         }
-
         function registerStream(url, text) {
             const usherUrl = new URL(url);
             const variants = Lib.parseMaster(text);
@@ -582,7 +546,6 @@ twitch-videoad.js text/javascript
             pruneStreams(stream);
             log(`stream ${channel}: ${variants.map((v) => v.label).join(', ')}`);
         }
-
         function pruneStreams(keep) {
             for (const stream of streams.values()) {
                 if (stream === keep || now() - stream.lastRequestAt < tuning.streamIdleMs) continue;
@@ -592,7 +555,6 @@ twitch-videoad.js text/javascript
                 }
             }
         }
-
         async function handleMedia(entry, input, options) {
             entry.lastPlayerRequestAt = entry.stream.lastRequestAt = now();
             const response = await realFetch(input, options);
@@ -605,7 +567,6 @@ twitch-videoad.js text/javascript
                 return playlistResponse(text);
             }
         }
-
         // While holding, the page pauses the player, which stops its playlist requests. Keep refreshing the playlist
         // ourselves so the page learns as soon as playback can continue.
         function keepRefreshingWhileHolding(entry) {
@@ -630,7 +591,6 @@ twitch-videoad.js text/javascript
             }, tuning.holdRefreshMs);
             if (entry.holdTimer && typeof entry.holdTimer.unref === 'function') entry.holdTimer.unref();
         }
-
         async function processMediaPlaylist(entry, text) {
             const { stream, variant, timeline } = entry;
             const simulating = simulation.until > now();
@@ -641,7 +601,6 @@ twitch-videoad.js text/javascript
             if (!mainClean) stream.cleanSince = 0;
             // Sessions that showed an ad number their segments from 0; those always need rewriting.
             const numberedGlobally = main.segments.length > 0 && main.segments[0].gseq === main.segments[0].seq;
-
             if (!timeline.virtual && mainClean && numberedGlobally && stream.sequence.offset === 0) {
                 // Nothing to do: return Twitch's playlist untouched, but track it so a later switch is seamless.
                 Lib.appendToTimeline(timeline, main.segments, variant.key, 'main', stream.sequence);
@@ -651,7 +610,6 @@ twitch-videoad.js text/javascript
                 return text;
             }
             timeline.virtual = true;
-
             let source = null;
             if (mainShowingAd) {
                 source = await pickBackup(stream, variant, entry.source && entry.source.id);
@@ -669,7 +627,6 @@ twitch-videoad.js text/javascript
                     source = { id: 'main', label: 'main', variant, exact: true, playlist: main };
                 }
             }
-
             entry.holding = !source;
             if (source) {
                 timeline.heldSince = 0;
@@ -692,7 +649,6 @@ twitch-videoad.js text/javascript
             if (mainClean && (!entry.source || entry.source.id === 'main')) {
                 releaseIdleSessions(stream);
             }
-
             // Low latency prefetch hints are only passed on from an ad-free source whose live edge we're at.
             const sourceNewest = source && Lib.newestLiveSegment(source.playlist);
             const sourceClean = source && (source.id === 'main' ? mainClean : !source.playlist.hasAdMarkers && !Lib.hasAdSegments(source.playlist));
@@ -707,7 +663,6 @@ twitch-videoad.js text/javascript
                 resumedAfterGap: !!change.resumedAfterGap,
                 changedRendition: !!change.changedRendition,
             });
-
             if (settings.debug && timeline.segments.length) {
                 const last = timeline.segments[timeline.segments.length - 1];
                 log(`${stream.channel} ${variant.label}: ${source ? source.label : 'hold'} +${change.appended}, player sequence ${timeline.segments[0].vseq}-${last.vseq}${change.resumedAfterGap ? ' (after gap)' : ''}`);
@@ -721,7 +676,6 @@ twitch-videoad.js text/javascript
                 endList: main.endList,
             });
         }
-
         function candidates() {
             const list = [];
             const add = (entry, kind, order) => {
@@ -736,7 +690,6 @@ twitch-videoad.js text/javascript
             }
             return list;
         }
-
         function ensureSessions(stream) {
             const time = now();
             for (const candidate of candidates()) {
@@ -753,7 +706,6 @@ twitch-videoad.js text/javascript
                 }
             }
         }
-
         function markSessionFailed(stream, session, reason) {
             session.state = 'failed';
             const failure = stream.failures.get(session.key) || { count: 0, at: 0 };
@@ -762,7 +714,6 @@ twitch-videoad.js text/javascript
             stream.failures.set(session.key, failure);
             log(`backup ${session.key} failed (${failure.count}x): ${reason}`);
         }
-
         // Backup sessions are kept for a while after an ad: Twitch sometimes shows ad markers again moments later.
         function releaseIdleSessions(stream) {
             if (!stream.sessions.size) return;
@@ -772,7 +723,6 @@ twitch-videoad.js text/javascript
                 stream.sessions.clear();
             }
         }
-
         function openSession(stream, candidate) {
             const session = Object.assign({ state: 'opening', createdAt: now(), variants: [], memos: new Map(), adSince: null }, candidate);
             session.ready = (async () => {
@@ -797,13 +747,11 @@ twitch-videoad.js text/javascript
             });
             return session;
         }
-
         function randomHex(length) {
             let value = '';
             while (value.length < length) value += Math.floor(Math.random() * 16).toString(16);
             return value;
         }
-
         async function requestAccessToken(login, playerType, platform) {
             const variables = Object.assign({}, gql.tokenVariables || {}, { isLive: true, login, isVod: false, vodID: '', playerType, platform });
             const body = { operationName: gql.tokenOperationName || 'PlaybackAccessToken', variables };
@@ -827,7 +775,6 @@ twitch-videoad.js text/javascript
             }
             return token;
         }
-
         // Polls every backup session (which also lets their own prerolls run out) and returns the best ad-free source
         // for `target`, or null when nothing acceptable is available.
         async function pickBackup(stream, target, preferId) {
@@ -853,7 +800,6 @@ twitch-videoad.js text/javascript
                 || (a.order - b.order));
             return acceptable[0] || null;
         }
-
         async function pollSession(stream, session, match) {
             const response = await withTimeout(realFetch(match.variant.url), tuning.mediaFetchTimeoutMs);
             if (!response) return null;
@@ -884,7 +830,6 @@ twitch-videoad.js text/javascript
                 newest: Lib.newestLiveSegment(playlist),
             };
         }
-
         function reportStatus(stream, status) {
             const full = Object.assign({ channel: stream.channel, adActive: false, mode: null, quality: null, sourceQuality: null, source: null, resumedAfterGap: false, changedRendition: false }, status);
             const disrupted = full.resumedAfterGap || full.changedRendition;
@@ -897,10 +842,8 @@ twitch-videoad.js text/javascript
             }
             post({ type: 'status', status: full });
         }
-
         log('worker hooks installed');
     }
-
     // -----------------------------------------------------------------------------------------------------------------
     // Page side
     // -----------------------------------------------------------------------------------------------------------------
@@ -922,17 +865,14 @@ twitch-videoad.js text/javascript
         return;
     }
     root[MESSAGE_TAG] = VERSION;
-
     const realFetch = root.fetch;
     const workers = new Set();
     const gqlContext = {};
     let settings = loadSettings();
     let lastStatus = null;
-
     if (typeof root.twitchAdSolutionsVersion !== 'undefined') {
         console.warn('[TwitchAdBlockHQ] Another Twitch ad blocking script (TwitchAdSolutions) is active. Use only one of them.');
     }
-
     function loadSettings() {
         try {
             const stored = JSON.parse(root.localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
@@ -941,11 +881,9 @@ twitch-videoad.js text/javascript
             return Object.assign({}, DEFAULT_SETTINGS);
         }
     }
-
     function effectiveTuning() {
         return Object.assign({}, TUNING, settings.tuning);
     }
-
     function sanitizeSettings(value) {
         const result = Object.assign({}, DEFAULT_SETTINGS);
         if (value.fallbackMode === 'hold' || value.fallbackMode === 'lowres') result.fallbackMode = value.fallbackMode;
@@ -962,13 +900,11 @@ twitch-videoad.js text/javascript
         }
         return result;
     }
-
     function broadcast(message) {
         for (const worker of workers) {
             worker.postMessage(Object.assign({ [MESSAGE_TAG]: true }, message));
         }
     }
-
     function readHeader(headers, name) {
         if (!headers) return null;
         if (typeof Headers !== 'undefined' && headers instanceof Headers) return headers.get(name);
@@ -978,14 +914,12 @@ twitch-videoad.js text/javascript
         }
         return null;
     }
-
     // Hooks look like the browser's own functions to page code that inspects them.
     function maskAsNative(fn, name) {
         Object.defineProperty(fn, 'toString', { value: () => `function ${name}() { [native code] }`, configurable: true });
         Object.defineProperty(fn, 'name', { value: name, configurable: true });
         return fn;
     }
-
     // Debug aid: client-side ad requests are delivered outside the stream and can't be handled via playlists.
     const clientAdRequests = {};
     function noteClientAdRequest(url) {
@@ -997,7 +931,6 @@ twitch-videoad.js text/javascript
             console.log(`[TwitchAdBlockHQ] client-side ad request (${key}) #${clientAdRequests[key]}, stream ad blocking active: ${!!(lastStatus && lastStatus.adActive)}`);
         }
     }
-
     function hookFetch() {
         root.fetch = maskAsNative(function (input, init) {
             try {
@@ -1025,7 +958,6 @@ twitch-videoad.js text/javascript
             }, 'open');
         }
     }
-
     function captureGqlContext(init) {
         const update = {
             clientId: readHeader(init.headers, 'Client-ID'),
@@ -1044,7 +976,6 @@ twitch-videoad.js text/javascript
         }
         if (changed) broadcast({ type: 'gql', value: Object.assign({}, gqlContext) });
     }
-
     function rewriteAccessTokenRequest(bodyText) {
         let body;
         try {
@@ -1070,11 +1001,9 @@ twitch-videoad.js text/javascript
         }
         return changed ? JSON.stringify(body) : bodyText;
     }
-
     function hookWorker() {
         const BaseWorker = root.Worker;
         if (typeof BaseWorker !== 'function') return;
-
         class TwitchAdBlockWorker extends BaseWorker {
             constructor(scriptURL, options) {
                 let source = null;
@@ -1103,13 +1032,11 @@ twitch-videoad.js text/javascript
                 this.addEventListener('message', revoke, { once: true });
                 setTimeout(revoke, 30000);
             }
-
             terminate() {
                 workers.delete(this);
                 super.terminate();
             }
         }
-
         maskAsNative(TwitchAdBlockWorker, 'Worker');
         Object.defineProperty(root, 'Worker', {
             configurable: true,
@@ -1125,7 +1052,6 @@ twitch-videoad.js text/javascript
             },
         });
     }
-
     function isTwitchWorkerUrl(scriptURL) {
         try {
             return new URL(String(scriptURL), root.location.href).origin.endsWith('twitch.tv');
@@ -1133,7 +1059,6 @@ twitch-videoad.js text/javascript
             return false;
         }
     }
-
     function loadWorkerSource(scriptURL) {
         const request = new XMLHttpRequest();
         request.open('GET', String(scriptURL), false);
@@ -1142,7 +1067,6 @@ twitch-videoad.js text/javascript
         if (request.status !== 200 && request.status !== 0) throw new Error(`HTTP ${request.status}`);
         return request.responseText;
     }
-
     function buildWorkerSource(twitchSource) {
         const init = { messageTag: MESSAGE_TAG, settings, tuning: TUNING, gql: gqlContext, defaults: { clientId: DEFAULT_CLIENT_ID, tokenHash: DEFAULT_TOKEN_HASH } };
         const prelude = `(function () {\n'use strict';\n(${workerMain.toString()})(${JSON.stringify(init)}, self, ${createPlaylistLib.toString()});\n})();\n`;
@@ -1150,7 +1074,6 @@ twitch-videoad.js text/javascript
         const directive = /^\s*(['"])use strict\1;?/.exec(twitchSource);
         return directive ? `${directive[0]}\n${prelude}${twitchSource.slice(directive[0].length)}` : prelude + twitchSource;
     }
-
     function attachWorker(worker) {
         workers.add(worker);
         worker.addEventListener('message', (event) => {
@@ -1164,7 +1087,6 @@ twitch-videoad.js text/javascript
             }
         });
     }
-
     async function handleWorkerPageFetch(worker, data) {
         let value;
         try {
@@ -1176,7 +1098,6 @@ twitch-videoad.js text/javascript
         }
         worker.postMessage({ [MESSAGE_TAG]: true, type: 'page-fetch-result', id: data.id, value });
     }
-
     // 'hold' pauses the player: a starving player would lower its automatic quality and stop requesting playlists.
     let hold = null;
     function onStatus(status) {
@@ -1212,7 +1133,6 @@ twitch-videoad.js text/javascript
             scheduleStallCheck();
         }
     }
-
     function resumePlayer() {
         const player = findMediaPlayer();
         if (player && typeof player.play === 'function') {
@@ -1222,12 +1142,10 @@ twitch-videoad.js text/javascript
             if (video) video.play().catch(() => {});
         }
     }
-
     function findVideo() {
         const videos = [...document.querySelectorAll('.video-player video'), ...document.getElementsByTagName('video')];
         return videos.find((video) => !isAdVideo(video)) || null;
     }
-
     // Twitch also plays ads outside the stream: separate <video> ads beside the player and in chat, served from the
     // Amazon ad CDN, plus stream display ads. The stream itself always plays from a MediaSource blob: URL, so the
     // host check can't match it.
@@ -1240,7 +1158,6 @@ twitch-videoad.js text/javascript
             return false;
         }
     }
-
     function hideDisplayAds() {
         if (!settings.hideDisplayAds) return;
         for (const video of document.getElementsByTagName('video')) {
@@ -1267,7 +1184,6 @@ twitch-videoad.js text/javascript
             element.style.setProperty('display', 'none', 'important');
         }
     }
-
     function startDisplayAdGuard() {
         for (const type of ['loadstart', 'play']) {
             document.addEventListener(type, (event) => {
@@ -1276,7 +1192,6 @@ twitch-videoad.js text/javascript
         }
         setInterval(hideDisplayAds, 1000);
     }
-
     function renderBanner(status) {
         const player = document.querySelector('.video-player');
         let banner = document.querySelector('.twitch-adblock-hq-banner');
@@ -1308,7 +1223,6 @@ twitch-videoad.js text/javascript
         banner.textContent = text;
         banner.style.display = 'block';
     }
-
     // After an ad the player can get stuck: holding leaves a hole in its buffer, the player may have paused itself, and
     // a quality change can leave the picture frozen while audio keeps playing. Watch playback for a while and fix these.
     let stallWatchTimer = null;
@@ -1361,7 +1275,6 @@ twitch-videoad.js text/javascript
             }
         }, 500);
     }
-
     function findMediaPlayer() {
         const rootNode = document.querySelector('#root');
         if (!rootNode) return null;
@@ -1381,7 +1294,6 @@ twitch-videoad.js text/javascript
         }
         return null;
     }
-
     function exposeApi() {
         root.twitchAdBlockHQ = Object.freeze({
             version: VERSION,
@@ -1413,7 +1325,6 @@ twitch-videoad.js text/javascript
             },
         });
     }
-
     hookFetch();
     hookWorker();
     startDisplayAdGuard();

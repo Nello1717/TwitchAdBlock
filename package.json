@@ -1,6 +1,6 @@
 {
   "name": "twitch-adblock-hq",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "private": true,
   "description": "Blocks Twitch ads without dropping the stream to low quality",
   "license": "MIT",
