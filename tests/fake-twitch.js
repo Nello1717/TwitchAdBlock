@@ -7,6 +7,7 @@
 //    #EXT-X-TWITCH-LIVE-SEQUENCE carries the channel-wide number of the first live segment
 //  - such sessions label live segments with a program date time that is ~780ms off
 //  - ad segments are titled "Amazon|..." and announced by a twitch-stitched-ad DATERANGE
+//  - some breaks only announce the ad (DATERANGE markers) while every segment stays live
 
 const FULL_LADDER = [
     { name: '1080p60', resolution: '1920x1080', fps: '60.000', bandwidth: 6000000 },
@@ -19,7 +20,7 @@ const WINDOW = 6;
 const BASE_TIME = Date.parse('2026-09-13T01:00:00.000Z');
 
 class FakeTwitch {
-    // plan(playerType, sessionNumber) -> { preroll: segments, midrolls: [{ start: tick, length: segments }] }
+    // plan(playerType, sessionNumber) -> { preroll, midrolls: [{ start, length }], markerOnly: [{ start, length }] }
     constructor(plan) {
         this.plan = plan;
         this.tick = 1000;
@@ -48,9 +49,9 @@ class FakeTwitch {
 
     openSession(playerType) {
         const id = ++this.sessionCount;
-        const plan = Object.assign({ preroll: 0, midrolls: [] }, this.plan(playerType, id));
+        const plan = Object.assign({ preroll: 0, midrolls: [], markerOnly: [] }, this.plan(playerType, id));
         const ladder = playerType === 'autoplay' ? LOW_LADDER : FULL_LADDER;
-        this.sessions.set(id, { id, playerType, ladder, start: this.tick, preroll: plan.preroll, midrolls: plan.midrolls });
+        this.sessions.set(id, { id, playerType, ladder, start: this.tick, preroll: plan.preroll, midrolls: plan.midrolls, markerOnly: plan.markerOnly });
         const lines = ['#EXTM3U', '#EXT-X-TWITCH-INFO:NODE="test",SERVER-TIME="1789264318.61"'];
         for (const variant of ladder) {
             lines.push(`#EXT-X-MEDIA:TYPE=VIDEO,GROUP-ID="${variant.name}",NAME="${variant.name}",AUTOSELECT=YES,DEFAULT=YES`);
@@ -97,7 +98,7 @@ class FakeTwitch {
         lines.push('#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:6', `#EXT-X-MEDIA-SEQUENCE:${mediaSequence}`);
         if (liveSequence !== null) lines.push(`#EXT-X-TWITCH-LIVE-SEQUENCE:${liveSequence}`);
         lines.push(`#EXT-X-DATERANGE:ID="playlist-creation-1",CLASS="timestamp",START-DATE="2026-09-13T01:00:00.000Z",END-ON-NEXT=YES,X-SERVER-TIME="1789264318.82"`);
-        if (hasAds) {
+        if (hasAds || session.markerOnly.some((m) => this.tick >= m.start && this.tick < m.start + m.length)) {
             lines.push('#EXT-X-DATERANGE:ID="stitched-ad-1",CLASS="twitch-stitched-ad",START-DATE="2026-09-13T01:00:00.000Z",DURATION=30.000,X-TV-TWITCH-AD-ROLL-TYPE="PREROLL"');
         }
         lines.push(...body);

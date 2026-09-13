@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch AdBlock HQ
 // @namespace    https://github.com/Nello1717/TwitchAdBlock
-// @version      1.0.0
+// @version      1.1.0
 // @description  Blocks Twitch ads without dropping the stream to low quality
 // @author       Nello
 // @license      MIT
@@ -32,7 +32,7 @@
 (function (root) {
     'use strict';
 
-    const VERSION = '1.0.0';
+    const VERSION = '1.1.0';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
 
@@ -43,23 +43,37 @@
         fallbackMode: 'hold',
         // 'lowres' only: never show a fallback stream below this height in pixels (0 = no limit).
         minFallbackHeight: 0,
-        // Access token player types used for full quality backup sessions ('type' or 'type/platform').
-        backupPlayerTypes: ['embed', 'site', 'popout'],
+        // 'hold' only: pause the player while waiting. Without the pause a starving player may lower its automatic
+        // quality selection and shows a loading spinner instead.
+        pauseDuringHold: true,
+        // 'hold' only: after a long wait, continue at the live edge (like Twitch after an ad) rather than where
+        // playback stopped. Continuing where it stopped keeps every second of the stream but adds delay.
+        resumeAtLiveEdge: true,
+        // Access token player types used for full quality backup sessions ('type' or 'type/platform'). All are
+        // opened in parallel; the order only breaks ties.
+        backupPlayerTypes: ['site', 'popout', 'mobile_web', 'embed'],
         // Player types used for the low quality fallback. Twitch keeps these (360p) streams ad-free.
         fallbackPlayerTypes: ['autoplay/android'],
         // Player type requested for the player's own session instead of 'site' (null = leave unchanged).
         forcePlayerType: 'popout',
+        // Hide, mute and pause Twitch's separate video ads (beside the player and in chat) and stream display ads.
+        // These are delivered outside the stream, so playlist handling can't remove them.
+        hideDisplayAds: true,
         // Show a small notice on the player while an ad is being blocked.
         showBanner: true,
         // Log decisions to the console.
         debug: false,
+        // Advanced: override values from TUNING below, e.g. { sessionWaitMs: 2000 }.
+        tuning: {},
     };
 
     const TUNING = {
         sessionWaitMs: 3000, // How long a playlist request waits for backup sessions that are still opening
         mediaFetchTimeoutMs: 2500, // Timeout for backup media playlist requests
         pageFetchTimeoutMs: 5000, // Timeout for access token requests made through the page
-        sessionRetryMs: 5000, // Delay before a failed backup session is opened again
+        sessionRetryMs: 5000, // Delay before a failed backup session is opened again (doubles on repeated failures)
+        sessionRetryMaxMs: 60000, // Longest delay between retries of a failing player type
+        sessionLingerMs: 30000, // Keep backup sessions this long after an ad, in case ad markers come back
         sessionMaxAdMs: 90000, // Replace a backup session that has shown ads for this long
         sessionMaxAgeMs: 600000, // Replace backup sessions older than this (access tokens expire)
         streamIdleMs: 60000, // Forget streams whose playlists have not been requested for this long
@@ -164,8 +178,13 @@
             return best ? { variant: best, exact: false } : null;
         }
 
+        // URL fragments of ad and placeholder segments, as observed in the field by TwitchAdSolutions.
+        // Real segment URLs use a base64url token, so these slash-delimited fragments can't occur in them by chance.
+        const AD_SEGMENT_URL_PATTERNS = ['/adsquared/', '/_404/', '/processing'];
+
+        // twitch-stitched-ad, twitch-stitched-* variants, twitch-ad-quartile, twitch-maf-ad, ...
         function isAdDateRangeClass(className) {
-            return /(^|-)ad(-|$)/.test(className);
+            return /(^|-)ad(-|$)/.test(className) || className.includes('stitched');
         }
 
         function parseMedia(text, knownSequenceByUri) {
@@ -182,6 +201,7 @@
             };
             let pdt = null;
             let discontinuity = false;
+            let inCue = false; // Between SCTE-35 #EXT-X-CUE-OUT and #EXT-X-CUE-IN
             for (let i = 0; i < lines.length; i++) {
                 const line = lines[i].trim();
                 if (!line) continue;
@@ -191,13 +211,16 @@
                     const comma = line.indexOf(',');
                     const durationText = comma < 0 ? line.slice(8) : line.slice(8, comma);
                     const title = comma < 0 ? '' : line.slice(comma + 1);
+                    const uri = lines[uriIndex].trim();
+                    const forcedAd = inCue || AD_SEGMENT_URL_PATTERNS.some((pattern) => uri.includes(pattern));
                     playlist.segments.push({
                         seq: playlist.mediaSequence + playlist.segments.length,
                         duration: parseFloat(durationText) || 0,
                         durationText,
                         title,
-                        live: title.startsWith('live'),
-                        uri: lines[uriIndex].trim(),
+                        live: title.startsWith('live') && !forcedAd,
+                        forcedAd,
+                        uri,
                         pdt,
                         pdtMs: pdt ? Date.parse(pdt) : NaN,
                         discontinuity,
@@ -206,6 +229,11 @@
                     pdt = null;
                     discontinuity = false;
                     i = uriIndex;
+                } else if (line.startsWith('#EXT-X-CUE-OUT')) {
+                    inCue = true;
+                    playlist.hasAdMarkers = true;
+                } else if (line.startsWith('#EXT-X-CUE-IN')) {
+                    inCue = false;
                 } else if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
                     pdt = line.slice(25);
                 } else if (line === '#EXT-X-DISCONTINUITY') {
@@ -219,7 +247,7 @@
                     playlist.targetDuration = parseInt(line.slice(22), 10) || 0;
                 } else if (line.startsWith('#EXT-X-DATERANGE:')) {
                     const className = parseAttributes(line.slice(17)).CLASS || '';
-                    if (isAdDateRangeClass(className)) {
+                    if (isAdDateRangeClass(className) || line.includes('X-TV-TWITCH-AD') || line.includes('SCTE35-OUT')) {
                         playlist.hasAdMarkers = true;
                     }
                     playlist.dateRanges.push({ line, className });
@@ -229,9 +257,9 @@
                     playlist.endList = true;
                 }
             }
-            if (!playlist.hasAdMarkers && !playlist.segments.some((s) => s.live)) {
+            if (!playlist.hasAdMarkers && !playlist.segments.some((s) => s.title.startsWith('live'))) {
                 // Unknown segment titles and no ad markers: don't mistake the stream for an ad.
-                playlist.segments.forEach((s) => { s.live = true; });
+                playlist.segments.forEach((s) => { s.live = !s.forcedAd; });
             }
             assignGlobalSequence(playlist, knownSequenceByUri);
             return playlist;
@@ -313,7 +341,7 @@
         // Adds live segments newer than the timeline's newest segment. Returns what changed.
         // After a gap only the newest `maxAfterGap` segments are added, so playback resumes close to live.
         function appendToTimeline(timeline, segments, variantKey, sourceId, sequence, maxAfterGap) {
-            const result = { appended: 0, resumedAfterGap: false, switchedSource: false };
+            const result = { appended: 0, resumedAfterGap: false, switchedSource: false, changedRendition: false };
             let fresh = segments.filter((s) => s.live && s.gseq !== null && s.gseq > timeline.lastGseq
                 && !(timeline.virtual && s.gseq < sequence.offsetSince)); // Older ones would reuse numbers from before a gap
             const newest = timeline.segments[timeline.segments.length - 1];
@@ -342,6 +370,9 @@
                 }
                 if (previous && !sameSource) {
                     result.switchedSource = true;
+                }
+                if (previous && previous.variantKey !== variantKey) {
+                    result.changedRendition = true;
                 }
                 // Sessions label the same segment with slightly different times; keep the timeline's clock continuous.
                 let pdtMs = segment.pdtMs;
@@ -440,8 +471,8 @@
         const Lib = createLib();
         const realFetch = scope.fetch.bind(scope);
         const tag = init.messageTag;
-        const tuning = init.tuning;
         let settings = init.settings;
+        let tuning = Object.assign({}, init.tuning, settings.tuning);
         const gql = Object.assign({}, init.gql);
         const streams = new Map();
         const mainPlaylists = new Map(); // player's media playlist URL -> { stream, variant, timeline, memo }
@@ -463,6 +494,7 @@
                 Object.assign(gql, data.value);
             } else if (data.type === 'settings') {
                 settings = data.value;
+                tuning = Object.assign({}, init.tuning, settings.tuning);
             } else if (data.type === 'simulate-ad') {
                 simulation = { until: now() + data.seconds * 1000, includeBackups: !!data.includeBackups };
                 log('simulating ad for', data.seconds, 's', data.includeBackups ? '(including backups)' : '');
@@ -493,6 +525,7 @@
             }
             return realFetch(input, options);
         };
+        Object.defineProperty(scope.fetch, 'toString', { value: () => 'function fetch() { [native code] }', configurable: true });
 
         function isUsherUrl(url) {
             return /\/channel\/hls\/[^/?]+\.m3u8/.test(url) && !url.includes('picture-by-picture');
@@ -550,7 +583,10 @@
             const variants = Lib.parseMaster(text);
             if (!variants.length) return;
             const channel = decodeURIComponent(usherUrl.pathname.split('/').pop().replace(/\.m3u8$/, '')).toLowerCase();
-            const stream = { id: nextId++, channel, usherUrl, variants, sessions: new Map(), sequence: Lib.createSequenceState(), lastRequestAt: now(), adActive: false, statusKey: null };
+            const stream = {
+                id: nextId++, channel, usherUrl, variants, sessions: new Map(), failures: new Map(), cleanSince: 0,
+                sequence: Lib.createSequenceState(), lastRequestAt: now(), adActive: false, statusKey: null,
+            };
             streams.set(stream.id, stream);
             for (const variant of variants) {
                 mainPlaylists.set(variant.url, { stream, variant, timeline: Lib.createTimeline(), memo: new Map(), source: null });
@@ -614,6 +650,7 @@
             Lib.rememberSequence(entry.memo, main);
             const mainShowingAd = simulating || Lib.isShowingAd(main);
             const mainClean = !simulating && !main.hasAdMarkers && !Lib.hasAdSegments(main);
+            if (!mainClean) stream.cleanSince = 0;
             // Sessions that showed an ad number their segments from 0; those always need rewriting.
             const numberedGlobally = main.segments.length > 0 && main.segments[0].gseq === main.segments[0].seq;
 
@@ -621,7 +658,7 @@
                 // Nothing to do: return Twitch's playlist untouched, but track it so a later switch is seamless.
                 Lib.appendToTimeline(timeline, main.segments, variant.key, 'main', stream.sequence);
                 Lib.trimTimeline(timeline, tuning.maxTimelineSegments);
-                if (stream.sessions.size) stream.sessions.clear();
+                releaseIdleSessions(stream);
                 reportStatus(stream, { adActive: false });
                 return text;
             }
@@ -639,10 +676,9 @@
                     if (source && !source.exact) source = null;
                 }
                 if (!source) {
+                    // Also covers breaks where Twitch only announces the ad (markers) while every segment stays live:
+                    // the main session is played at full quality and the markers are left out of the playlist.
                     source = { id: 'main', label: 'main', variant, exact: true, playlist: main };
-                }
-                if (main.hasAdMarkers && !Lib.hasAdSegments(main)) {
-                    ensureSessions(stream); // An ad is announced: get backups ready.
                 }
             }
 
@@ -653,7 +689,7 @@
                 keepRefreshingWhileHolding(entry);
                 if (!timeline.heldSince) {
                     timeline.heldSince = now();
-                } else if (now() - timeline.heldSince > tuning.skipToLiveAfterHoldMs) {
+                } else if (settings.resumeAtLiveEdge !== false && now() - timeline.heldSince > tuning.skipToLiveAfterHoldMs) {
                     timeline.skipToLive = true; // Like Twitch after an ad: continue at the live edge instead of replaying the pause
                 }
             }
@@ -665,8 +701,8 @@
                 }
                 entry.source = source;
             }
-            if (mainClean && (!entry.source || entry.source.id === 'main') && stream.sessions.size) {
-                stream.sessions.clear();
+            if (mainClean && (!entry.source || entry.source.id === 'main')) {
+                releaseIdleSessions(stream);
             }
 
             // Low latency prefetch hints are only passed on from an ad-free source whose live edge we're at.
@@ -681,6 +717,7 @@
                 sourceQuality: source ? source.variant.label : null,
                 source: source ? source.label : null,
                 resumedAfterGap: !!change.resumedAfterGap,
+                changedRendition: !!change.changedRendition,
             });
 
             if (settings.debug && timeline.segments.length) {
@@ -716,13 +753,35 @@
             const time = now();
             for (const candidate of candidates()) {
                 const session = stream.sessions.get(candidate.key);
+                const failure = stream.failures.get(candidate.key);
+                // A player type that keeps failing (e.g. GQL "server error") is retried less and less often.
+                const coolingDown = failure && time - failure.at < Math.min(tuning.sessionRetryMs * 2 ** (failure.count - 1), tuning.sessionRetryMaxMs);
                 const replace = !session
-                    || (session.state === 'failed' && time - session.createdAt > tuning.sessionRetryMs)
+                    || session.state === 'failed'
                     || (session.adSince && time - session.adSince > tuning.sessionMaxAdMs)
                     || time - session.createdAt > tuning.sessionMaxAgeMs;
-                if (replace) {
+                if (replace && !coolingDown) {
                     stream.sessions.set(candidate.key, openSession(stream, candidate));
                 }
+            }
+        }
+
+        function markSessionFailed(stream, session, reason) {
+            session.state = 'failed';
+            const failure = stream.failures.get(session.key) || { count: 0, at: 0 };
+            failure.count++;
+            failure.at = now();
+            stream.failures.set(session.key, failure);
+            log(`backup ${session.key} failed (${failure.count}x): ${reason}`);
+        }
+
+        // Backup sessions are kept for a while after an ad: Twitch sometimes shows ad markers again moments later.
+        function releaseIdleSessions(stream) {
+            if (!stream.sessions.size) return;
+            if (!stream.cleanSince) {
+                stream.cleanSince = now();
+            } else if (now() - stream.cleanSince >= tuning.sessionLingerMs) {
+                stream.sessions.clear();
             }
         }
 
@@ -743,10 +802,10 @@
                 session.variants = Lib.parseMaster(await response.text());
                 if (!session.variants.length) throw new Error('no variants');
                 session.state = 'ready';
+                stream.failures.delete(session.key);
                 log(`backup ${session.key} ready: ${session.variants.map((v) => v.label).join(', ')}`);
             })().catch((err) => {
-                session.state = 'failed';
-                log(`backup ${session.key} failed: ${err && err.message ? err.message : err}`);
+                markSessionFailed(stream, session, err && err.message ? err.message : err);
             });
             return session;
         }
@@ -793,7 +852,7 @@
             for (const session of stream.sessions.values()) {
                 if (session.state !== 'ready') continue;
                 const match = Lib.matchVariant(session.variants, target);
-                if (match) polls.push(pollSession(session, match));
+                if (match) polls.push(pollSession(stream, session, match));
             }
             const simulatingBackups = simulation.includeBackups && simulation.until > now();
             const usable = (await Promise.all(polls)).filter((r) => r && !r.showingAd && r.newest && !(simulatingBackups && r.kind === 'full'));
@@ -807,11 +866,11 @@
             return acceptable[0] || null;
         }
 
-        async function pollSession(session, match) {
+        async function pollSession(stream, session, match) {
             const response = await withTimeout(realFetch(match.variant.url), tuning.mediaFetchTimeoutMs);
             if (!response) return null;
             if (response.status !== 200) {
-                if (response.status === 403 || response.status === 404) session.state = 'failed';
+                if (response.status === 403 || response.status === 404) markSessionFailed(stream, session, `playlist HTTP ${response.status}`);
                 return null;
             }
             const text = await withTimeout(response.text(), tuning.mediaFetchTimeoutMs);
@@ -839,9 +898,10 @@
         }
 
         function reportStatus(stream, status) {
-            const full = Object.assign({ channel: stream.channel, adActive: false, mode: null, quality: null, sourceQuality: null, source: null, resumedAfterGap: false }, status);
-            const key = JSON.stringify(Object.assign({}, full, { resumedAfterGap: false }));
-            if (key === stream.statusKey && !full.resumedAfterGap) return;
+            const full = Object.assign({ channel: stream.channel, adActive: false, mode: null, quality: null, sourceQuality: null, source: null, resumedAfterGap: false, changedRendition: false }, status);
+            const disrupted = full.resumedAfterGap || full.changedRendition;
+            const key = JSON.stringify(Object.assign({}, full, { resumedAfterGap: false, changedRendition: false }));
+            if (key === stream.statusKey && !disrupted) return;
             stream.statusKey = key;
             if (full.adActive !== stream.adActive) {
                 stream.adActive = full.adActive;
@@ -858,6 +918,16 @@
     // -----------------------------------------------------------------------------------------------------------------
     if (typeof process !== 'undefined' && process.versions && process.versions.node) {
         module.exports = { createPlaylistLib, workerMain, DEFAULT_SETTINGS, TUNING };
+        return;
+    }
+    // Twitch pages contain several hidden auxiliary iframes. Only the top page and Twitch's embed player host a stream.
+    let nestedFrame = true;
+    try {
+        nestedFrame = root.top !== root;
+    } catch (err) {
+        // Treat an inaccessible parent as nested.
+    }
+    if (nestedFrame && !/^(player|embed)\.twitch\.tv$/.test(root.location.hostname) && !root.location.pathname.startsWith('/embed/')) {
         return;
     }
     if (root[MESSAGE_TAG]) {
@@ -884,6 +954,10 @@
         }
     }
 
+    function effectiveTuning() {
+        return Object.assign({}, TUNING, settings.tuning);
+    }
+
     function sanitizeSettings(value) {
         const result = Object.assign({}, DEFAULT_SETTINGS);
         if (value.fallbackMode === 'hold' || value.fallbackMode === 'lowres') result.fallbackMode = value.fallbackMode;
@@ -891,8 +965,13 @@
         if (Array.isArray(value.backupPlayerTypes)) result.backupPlayerTypes = value.backupPlayerTypes.map(String).filter(Boolean);
         if (Array.isArray(value.fallbackPlayerTypes)) result.fallbackPlayerTypes = value.fallbackPlayerTypes.map(String).filter(Boolean);
         if (value.forcePlayerType === null || typeof value.forcePlayerType === 'string') result.forcePlayerType = value.forcePlayerType || null;
-        if (typeof value.showBanner === 'boolean') result.showBanner = value.showBanner;
-        if (typeof value.debug === 'boolean') result.debug = value.debug;
+        for (const key of ['pauseDuringHold', 'resumeAtLiveEdge', 'hideDisplayAds', 'showBanner', 'debug']) {
+            if (typeof value[key] === 'boolean') result[key] = value[key];
+        }
+        result.tuning = {};
+        for (const [key, number] of Object.entries(value.tuning || {})) {
+            if (Object.prototype.hasOwnProperty.call(TUNING, key) && Number.isFinite(number) && number >= 0) result.tuning[key] = number;
+        }
         return result;
     }
 
@@ -912,10 +991,30 @@
         return null;
     }
 
+    // Hooks look like the browser's own functions to page code that inspects them.
+    function maskAsNative(fn, name) {
+        Object.defineProperty(fn, 'toString', { value: () => `function ${name}() { [native code] }`, configurable: true });
+        Object.defineProperty(fn, 'name', { value: name, configurable: true });
+        return fn;
+    }
+
+    // Debug aid: client-side ad requests are delivered outside the stream and can't be handled via playlists.
+    const clientAdRequests = {};
+    function noteClientAdRequest(url) {
+        if (!settings.debug || !String(url).includes('edge.ads.twitch.tv')) return;
+        const type = /[?&]bp=(\w+)/.exec(url);
+        const key = type ? type[1] : 'unknown';
+        clientAdRequests[key] = (clientAdRequests[key] || 0) + 1;
+        if (clientAdRequests[key] === 1 || clientAdRequests[key] % 10 === 0) {
+            console.log(`[TwitchAdBlockHQ] client-side ad request (${key}) #${clientAdRequests[key]}, stream ad blocking active: ${!!(lastStatus && lastStatus.adActive)}`);
+        }
+    }
+
     function hookFetch() {
-        root.fetch = function (input, init) {
+        root.fetch = maskAsNative(function (input, init) {
             try {
                 const url = typeof input === 'string' ? input : input && input.url;
+                noteClientAdRequest(url);
                 if (url && url.startsWith('https://gql.twitch.tv/') && init) {
                     captureGqlContext(init);
                     if (typeof init.body === 'string' && init.body.includes('PlaybackAccessToken')) {
@@ -929,7 +1028,14 @@
                 console.warn('[TwitchAdBlockHQ] fetch hook error', err);
             }
             return realFetch.apply(this, arguments);
-        };
+        }, 'fetch');
+        if (settings.debug) {
+            const realOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = maskAsNative(function (method, url) {
+                noteClientAdRequest(url);
+                return realOpen.apply(this, arguments);
+            }, 'open');
+        }
     }
 
     function captureGqlContext(init) {
@@ -995,8 +1101,19 @@
                     super(scriptURL, options);
                     return;
                 }
-                super(URL.createObjectURL(new Blob([buildWorkerSource(source)], { type: 'text/javascript' })), options);
+                if (source.includes(MESSAGE_TAG)) {
+                    // Already carries our hooks (e.g. another Worker wrapper passed our blob through): don't hook twice.
+                    super(scriptURL, options);
+                    attachWorker(this);
+                    return;
+                }
+                const blobUrl = URL.createObjectURL(new Blob([buildWorkerSource(source)], { type: 'text/javascript' }));
+                super(blobUrl, options);
                 attachWorker(this);
+                // Free the blob once the worker is running.
+                const revoke = () => URL.revokeObjectURL(blobUrl);
+                this.addEventListener('message', revoke, { once: true });
+                setTimeout(revoke, 30000);
             }
 
             terminate() {
@@ -1005,6 +1122,7 @@
             }
         }
 
+        maskAsNative(TwitchAdBlockWorker, 'Worker');
         Object.defineProperty(root, 'Worker', {
             configurable: true,
             get() {
@@ -1083,14 +1201,14 @@
                 // At stream start the player hasn't played anything yet; it should start once the ad is handled.
                 const current = { wasPlaying: !!video && !video.paused, startup: !video || video.readyState < 2, timer: null };
                 hold = current;
-                if (current.wasPlaying) {
+                if (current.wasPlaying && settings.pauseDuringHold) {
                     current.timer = setTimeout(() => {
                         const player = findMediaPlayer();
                         if (hold === current && player && typeof player.pause === 'function') {
                             if (settings.debug) console.log('[TwitchAdBlockHQ] pausing the player until the ad is over');
                             player.pause();
                         }
-                    }, TUNING.holdPauseDelayMs);
+                    }, effectiveTuning().holdPauseDelayMs);
                 }
             }
         } else if (hold) {
@@ -1102,7 +1220,7 @@
                 resumePlayer();
                 scheduleStallCheck();
             }
-        } else if (status.resumedAfterGap && previous) {
+        } else if ((status.resumedAfterGap || status.changedRendition) && previous) {
             scheduleStallCheck();
         }
     }
@@ -1118,7 +1236,57 @@
     }
 
     function findVideo() {
-        return document.querySelector('.video-player video') || document.querySelector('video');
+        const videos = [...document.querySelectorAll('.video-player video'), ...document.getElementsByTagName('video')];
+        return videos.find((video) => !isAdVideo(video)) || null;
+    }
+
+    // Twitch also plays ads outside the stream: separate <video> ads beside the player and in chat, served from the
+    // Amazon ad CDN, plus stream display ads. The stream itself always plays from a MediaSource blob: URL, so the
+    // host check can't match it.
+    function isAdVideo(video) {
+        const src = video.currentSrc || video.getAttribute('src') || '';
+        if (!src || src.startsWith('blob:')) return false;
+        try {
+            return /(^|\.)media-amazon\.com$/.test(new URL(src, root.location.href).hostname);
+        } catch (err) {
+            return false;
+        }
+    }
+
+    function hideDisplayAds() {
+        if (!settings.hideDisplayAds) return;
+        for (const video of document.getElementsByTagName('video')) {
+            const marked = video.dataset.twitchAdblockHq === 'ad';
+            if (isAdVideo(video)) {
+                if (!marked) {
+                    video.dataset.twitchAdblockHq = 'ad';
+                    video.dataset.twitchAdblockHqMuted = String(video.muted);
+                    if (settings.debug) console.log('[TwitchAdBlockHQ] hiding a separate video ad');
+                }
+                // Re-applied every time: re-renders can drop the style, and a hidden video would still play audio.
+                video.style.setProperty('display', 'none', 'important');
+                video.muted = true;
+                if (!video.paused) video.pause();
+            } else if (marked) {
+                // Twitch reuses <video> elements: restore one that now plays something else.
+                video.style.removeProperty('display');
+                video.muted = video.dataset.twitchAdblockHqMuted === 'true';
+                delete video.dataset.twitchAdblockHq;
+                delete video.dataset.twitchAdblockHqMuted;
+            }
+        }
+        for (const element of document.querySelectorAll('[data-test-selector="sda-wrapper"]')) {
+            element.style.setProperty('display', 'none', 'important');
+        }
+    }
+
+    function startDisplayAdGuard() {
+        for (const type of ['loadstart', 'play']) {
+            document.addEventListener(type, (event) => {
+                if (event.target instanceof HTMLVideoElement) hideDisplayAds();
+            }, true);
+        }
+        setInterval(hideDisplayAds, 1000);
     }
 
     function renderBanner(status) {
@@ -1153,15 +1321,17 @@
         banner.style.display = 'block';
     }
 
-    // After holding, the skipped time leaves a hole in the player's buffer and the player may have paused itself.
-    // Watch playback for a while: jump over the hole right away and resume playback if it doesn't continue.
+    // After an ad the player can get stuck: holding leaves a hole in its buffer, the player may have paused itself, and
+    // a quality change can leave the picture frozen while audio keeps playing. Watch playback for a while and fix these.
     let stallWatchTimer = null;
     function scheduleStallCheck() {
         clearInterval(stallWatchTimer);
         const startedAt = Date.now();
         let lastTime = -1;
+        let lastFrames = -1;
         let stuckSince = 0;
-        let resumes = 0;
+        let frozenSince = 0;
+        let nudges = 0;
         stallWatchTimer = setInterval(() => {
             const video = findVideo();
             if (!video || Date.now() - startedAt > 30000) {
@@ -1182,11 +1352,17 @@
             // A pause long after the ad is the viewer's choice; only undo pauses right after resuming.
             const stuck = time === lastTime && (!video.paused || Date.now() - startedAt < 8000);
             stuckSince = stuck ? stuckSince || Date.now() : 0;
+            // Browsers stop decoding video in hidden tabs, so frame counts are only meaningful while visible.
+            const frames = typeof video.getVideoPlaybackQuality === 'function' ? video.getVideoPlaybackQuality().totalVideoFrames : -1;
+            const frozen = !video.paused && document.visibilityState === 'visible' && time !== lastTime && frames >= 0 && frames === lastFrames;
+            frozenSince = frozen ? frozenSince || Date.now() : 0;
             lastTime = time;
-            if (stuckSince && Date.now() - stuckSince > 3000 && resumes < 3) {
-                resumes++;
+            lastFrames = frames;
+            if ((stuckSince || frozenSince) && Date.now() - (stuckSince || frozenSince) > 3000 && nudges < 3) {
+                nudges++;
+                if (settings.debug) console.log(`[TwitchAdBlockHQ] ${stuckSince ? 'playback stuck' : 'picture frozen'} after the ad; resuming`);
                 stuckSince = 0;
-                if (settings.debug) console.log('[TwitchAdBlockHQ] resuming playback after the ad');
+                frozenSince = 0;
                 const player = findMediaPlayer();
                 if (player && typeof player.play === 'function') {
                     if (!video.paused && typeof player.pause === 'function') player.pause();
@@ -1252,6 +1428,8 @@
 
     hookFetch();
     hookWorker();
+    startDisplayAdGuard();
     exposeApi();
     console.log(`[TwitchAdBlockHQ] v${VERSION} active (fallback: ${settings.fallbackMode})`);
+    if (settings.debug) console.log('[TwitchAdBlockHQ] settings', JSON.stringify(settings));
 })(typeof window !== 'undefined' ? window : globalThis);

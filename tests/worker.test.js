@@ -208,6 +208,33 @@ test('quality switches during an ad keep sequence numbers aligned', async () => 
     assert.ok(hdSegments.every((uri) => uri.includes('/720p60/')), '720p60 is served from a 720p60 backup');
 });
 
+test('ad markers without ad segments: stays on the main session and hides the markers from the player', async () => {
+    const plan = (playerType, n) => (n === 1 ? { markerOnly: [{ start: 1003, length: 8 }] } : { preroll: 40 });
+    const harness = createHarness(plan, { fallbackMode: 'lowres' });
+    const [source] = await harness.openStream();
+    for (let i = 0; i < 16; i++) await harness.refresh(source.url);
+    for (const { text } of harness.outputs) {
+        assert.ok(!text.includes('stitched'), 'ad markers never reach the player');
+        assert.ok(segmentsOf(text).every((uri) => uri.startsWith('1/1080p60/')), 'full quality from the main session, never a 360p fallback');
+    }
+    assert.ok(harness.statuses.every((s) => s.mode !== 'lowres' && s.mode !== 'hold'));
+    assert.equal(harness.twitch.sessionCount, 1, 'no backup sessions are opened for an announcement alone');
+    const ticks = assertPlayerView(harness.outputs);
+    for (let i = 1; i < ticks.length; i++) assert.equal(ticks[i], ticks[i - 1] + 1);
+});
+
+test('backup sessions are reused when an ad follows shortly after another', async () => {
+    const plan = (playerType, n) => (n === 1 ? { midrolls: [{ start: 1003, length: 4 }, { start: 1020, length: 4 }] } : {});
+    const harness = createHarness(plan);
+    const [source] = await harness.openStream();
+    for (let i = 0; i < 12; i++) await harness.refresh(source.url);
+    const sessionsAfterFirstAd = harness.twitch.sessionCount;
+    for (let i = 0; i < 16; i++) await harness.refresh(source.url);
+    assert.ok(harness.statuses.filter((s) => s.mode === 'backup').length >= 2);
+    assert.equal(harness.twitch.sessionCount, sessionsAfterFirstAd, 'no new access tokens for the second ad');
+    assertPlayerView(harness.outputs);
+});
+
 test('simulateAd exercises the backup path on demand', async () => {
     const harness = createHarness(() => ({}));
     const [source] = await harness.openStream();
@@ -229,4 +256,5 @@ test('failed access token requests fall back gracefully', async () => {
     for (let i = 0; i < 10; i++) await harness.refresh(source.url);
     assertPlayerView(harness.outputs);
     assert.ok(segmentsOf(harness.outputs.at(-1).text).every((uri) => uri.startsWith('1/1080p60/')), 'main session resumes after its preroll');
+    assert.equal(usherRequests, 1 + DEFAULT_SETTINGS.backupPlayerTypes.length, 'failing player types are not retried on every refresh');
 });

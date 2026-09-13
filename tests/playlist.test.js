@@ -165,6 +165,24 @@ https://edge.test/live-503.ts
     assert.deepEqual(playlist.segments.filter((s) => s.live).map((s) => s.gseq), [500, 503]);
 });
 
+test('parseMedia recognises SCTE-35 cues, stitched variants and ad segment URLs', () => {
+    const cue = Lib.parseMedia(clean(10, 4).replace('#EXT-X-PROGRAM-DATE-TIME:', '#EXT-X-CUE-OUT:DURATION=4\n#EXT-X-PROGRAM-DATE-TIME:')
+        .replace(/(live-11\.ts\n)/, '$1#EXT-X-CUE-IN\n'));
+    assert.equal(cue.hasAdMarkers, true);
+    assert.deepEqual(cue.segments.map((s) => s.live), [false, false, true, true], 'segments inside CUE-OUT/CUE-IN are ads');
+
+    const stitchedVariant = Lib.parseMedia(clean(10, 2).replace('CLASS="timestamp"', 'CLASS="twitch-stitched-mid"'));
+    assert.equal(stitchedVariant.hasAdMarkers, true);
+    const adAttribute = Lib.parseMedia(clean(10, 2) + '#EXT-X-DATERANGE:ID="x",CLASS="other",START-DATE="2026-09-13T01:00:00Z",X-TV-TWITCH-AD-ROLL-TYPE="MIDROLL"\n');
+    assert.equal(adAttribute.hasAdMarkers, true);
+
+    const urls = Lib.parseMedia(clean(10, 3).replace('/main/live-11.ts', '/adsquared/live-11.ts'));
+    assert.deepEqual(urls.segments.map((s) => s.live), [true, false, true]);
+
+    const trigger = Lib.parseMedia(clean(10, 2).replace('CLASS="timestamp"', 'CLASS="twitch-trigger"'));
+    assert.equal(trigger.hasAdMarkers, false, 'twitch-trigger also appears in ad-free playlists');
+});
+
 test('parseMedia keeps sequence numbers learned from earlier refreshes', () => {
     const memo = new Map();
     Lib.rememberSequence(memo, Lib.parseMedia(clean(100, 3)));
