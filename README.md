@@ -21,6 +21,10 @@ On Chromium browsers with Manifest V3 userscript managers, enable *Allow user sc
 3. Add the filter `twitch.tv##+js(twitch-videoad)` under *My filters*.
 4. Restart the browser.
 
+uBlock Origin keeps its downloaded copy of the script until the address changes; restarting or "Update now" doesn't
+refresh it. To get a new version, add or change a version suffix at the end of the address, e.g. `...ublock-origin.js?v=1.1.2`,
+and click *Apply changes*.
+
 Don't combine it with other Twitch-specific ad blockers.
 
 ## Why other scripts end up in low quality
@@ -58,10 +62,8 @@ These observations come from live twitch.tv playlists (September 2026):
 5. When your session is ad-free again, playback switches back seamlessly.
 6. If no ad-free stream at your quality exists yet (e.g. every session is in the same midroll), the `fallbackMode`
    setting decides what happens:
-   - `hold` (default): never lower the quality. The player pauses behind a notice, and the script keeps checking
-     in the background. As soon as your session or a backup is ad-free at your quality, playback continues at the
-     live edge. Pausing, rather than letting the player starve, also stops Twitch's automatic quality selection
-     from stepping down.
+   - `hold` (default): never lower the quality. The player waits behind a notice while the script keeps checking.
+     As soon as your session or a backup is ad-free at your quality, playback continues at the live edge.
    - `lowres`: show the best lower-quality ad-free stream (usually 360p). Switch back to your quality the moment
      any session offers it ad-free.
 
@@ -90,7 +92,7 @@ twitchAdBlockHQ.resetSettings()
 | --- | --- | --- |
 | `fallbackMode` | `'hold'` | `'hold'` never lowers quality. `'lowres'` temporarily shows a lower-quality ad-free stream. |
 | `minFallbackHeight` | `0` | `lowres` only: never show a fallback below this height (e.g. `480`). |
-| `pauseDuringHold` | `true` | `hold` only: pause the player while waiting. `false` shows a loading spinner instead; Twitch's automatic quality may then step down. |
+| `pauseDuringHold` | `false` | `hold` only: pause the player while waiting instead of showing a loading spinner. Can leave the video stuttering after the ad (seen in Opera GX), so it's off by default. |
 | `resumeAtLiveEdge` | `true` | `hold` only: after waiting more than a few seconds, continue at the live edge. `false` continues where playback stopped when that part is still available (up to ~30 s), adding delay. |
 | `backupPlayerTypes` | `['site', 'popout', 'mobile_web', 'embed']` | Player types used for full-quality backup sessions (`'type'` or `'type/platform'`). All are opened in parallel; the order only breaks ties. |
 | `fallbackPlayerTypes` | `['autoplay/android']` | Player types used for the `lowres` fallback. |
@@ -105,7 +107,9 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 ## Limitations
 
 - During ads, the script can only play a quality that some Twitch session delivers ad-free. It checks several
-  sessions at once. If none qualifies, `hold` pauses and `lowres` shows lower quality; it never shows the ad.
+  sessions at once. If none qualifies, `hold` waits and `lowres` shows lower quality; it never shows the ad.
+- While `hold` waits, Twitch's automatic quality selection may step down; it recovers after the ad. Choosing a
+  fixed quality in the player avoids this.
 - A player type that keeps failing (Twitch sometimes answers token requests for `embed` with a GQL "server error")
   is retried with increasing delays, up to once a minute. Backup sessions are kept for 30 seconds after an ad in case
   ad markers come back.
@@ -118,12 +122,14 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 
 ## Troubleshooting
 
-- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.1 active`. With `debug: true` it also logs
+- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.2 active`. With `debug: true` it also logs
   `worker hooks installed` when a stream loads.
 - **Try the ad path without waiting for an ad:** `twitchAdBlockHQ.simulateAd(30)` pretends your session shows a
   30-second ad. `twitchAdBlockHQ.simulateAd(30, true)` pretends full-quality backups do too, which exercises
   `hold` / `lowres`.
 - `twitchAdBlockHQ.status()` returns the latest state (mode, quality, backup in use).
+- **Playback problems:** run `twitchAdBlockHQ.diagnostics()` while it happens. It prints the player state, every
+  video element (frames, dropped frames, buffer), the playback rate of the last minute and the script's recent actions.
 
 ## Development
 

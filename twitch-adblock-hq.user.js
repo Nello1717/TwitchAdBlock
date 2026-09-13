@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitch AdBlock HQ
 // @namespace    https://github.com/Nello1717/TwitchAdBlock
-// @version      1.1.1
+// @version      1.1.2
 // @description  Blocks Twitch ads without dropping the stream to low quality
 // @author       Nello
 // @license      MIT
@@ -32,7 +32,7 @@
 (function (root) {
     'use strict';
 
-    const VERSION = '1.1.1';
+    const VERSION = '1.1.2';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
 
@@ -43,9 +43,9 @@
         fallbackMode: 'hold',
         // 'lowres' only: never show a fallback stream below this height in pixels (0 = no limit).
         minFallbackHeight: 0,
-        // 'hold' only: pause the player while waiting. Without the pause a starving player may lower its automatic
-        // quality selection and shows a loading spinner instead.
-        pauseDuringHold: true,
+        // 'hold' only: pause the player while waiting, instead of showing a loading spinner. Off by default: restarting
+        // Twitch's player after the pause can leave the video stuttering while audio plays (seen in Opera GX).
+        pauseDuringHold: false,
         // 'hold' only: after a long wait, continue at the live edge (like Twitch after an ad) rather than where
         // playback stopped. Continuing where it stopped keeps every second of the stream but adds delay.
         resumeAtLiveEdge: true,
@@ -1189,36 +1189,54 @@
         worker.postMessage({ [MESSAGE_TAG]: true, type: 'page-fetch-result', id: data.id, value });
     }
 
+    // Recent decisions and actions, for twitchAdBlockHQ.diagnostics() and the debug console log.
+    const events = [];
+    function note(type, detail) {
+        events.push(Object.assign({ at: new Date().toISOString().slice(11, 23), type }, detail));
+        if (events.length > 200) events.splice(0, events.length - 200);
+        if (settings.debug) console.log(`[TwitchAdBlockHQ] ${type}`, detail ? JSON.stringify(detail) : '');
+    }
+
     // 'hold' pauses the player: a starving player would lower its automatic quality and stop requesting playlists.
     let hold = null;
     function onStatus(status) {
         const previous = lastStatus;
         lastStatus = status;
         renderBanner(status);
+        if (!previous || previous.mode !== status.mode || previous.source !== status.source) {
+            note('status', { mode: status.mode, quality: status.quality, source: status.source, sourceQuality: status.sourceQuality });
+        }
         if (status.mode === 'hold') {
             if (!hold) {
                 const video = findVideo();
                 // At stream start the player hasn't played anything yet; it should start once the ad is handled.
-                const current = { wasPlaying: !!video && !video.paused, startup: !video || video.readyState < 2, timer: null };
+                const current = { wasPlaying: !!video && !video.paused, startup: !video || video.readyState < 2, quality: readQuality(findMediaPlayer()), paused: false, timer: null };
                 hold = current;
                 if (current.wasPlaying && settings.pauseDuringHold) {
                     current.timer = setTimeout(() => {
                         const player = findMediaPlayer();
                         if (hold === current && player && typeof player.pause === 'function') {
-                            if (settings.debug) console.log('[TwitchAdBlockHQ] pausing the player until the ad is over');
+                            note('pausing the player until the ad is over', { quality: current.quality });
+                            current.paused = true;
                             player.pause();
                         }
                     }, effectiveTuning().holdPauseDelayMs);
                 }
             }
         } else if (hold) {
-            clearTimeout(hold.timer);
-            const resume = hold.wasPlaying || hold.startup;
+            const ended = hold;
+            clearTimeout(ended.timer);
             hold = null;
-            if (resume) {
-                if (settings.debug) console.log('[TwitchAdBlockHQ] resuming playback');
+            if (ended.wasPlaying || ended.startup) {
+                note('resuming playback', { quality: ended.quality });
                 resumePlayer();
-                scheduleStallCheck();
+                if (ended.paused) {
+                    // The player restarts its pipeline: leave it alone apart from a late play() and the quality.
+                    restoreQuality(ended.quality);
+                    watchResume();
+                } else {
+                    scheduleStallCheck();
+                }
             }
         } else if ((status.resumedAfterGap || status.changedRendition) && previous) {
             scheduleStallCheck();
@@ -1235,9 +1253,63 @@
         }
     }
 
+    function readQuality(player) {
+        try {
+            const quality = player && typeof player.getQuality === 'function' ? player.getQuality() : null;
+            const auto = player && typeof player.isAutoQualityMode === 'function' ? player.isAutoQualityMode() : true;
+            return quality && quality.name ? { name: quality.name, auto } : null;
+        } catch (err) {
+            return null;
+        }
+    }
+
+    // Restarting the player can bring it back on automatic quality; put back a quality the viewer picked. Only once the
+    // player is playing again: changing quality while it is still starting up leaves it stuck buffering.
+    function restoreQuality(saved) {
+        if (!saved || saved.auto) return;
+        let attempts = 0;
+        const timer = setInterval(() => {
+            attempts++;
+            try {
+                const player = findMediaPlayer();
+                const video = findVideo();
+                const playing = player && typeof player.getState === 'function' ? player.getState() === 'Playing' : !!video && !video.paused && video.readyState >= 3;
+                if (!playing || !video || video.currentTime < 1) {
+                    if (attempts >= 60) clearInterval(timer);
+                    return;
+                }
+                const qualities = typeof player.getQualities === 'function' ? player.getQualities() || [] : [];
+                const match = qualities.find((quality) => quality.name === saved.name);
+                if (match) {
+                    const current = readQuality(player);
+                    if (!current || current.auto || current.name !== saved.name) {
+                        player.setQuality(match);
+                        note('restored quality', { quality: saved.name, was: current && current.name });
+                    }
+                    clearInterval(timer);
+                }
+            } catch (err) {
+                note('could not restore quality', { error: String(err) });
+                clearInterval(timer);
+            }
+            if (attempts >= 40) clearInterval(timer);
+        }, 500);
+    }
+
+    function watchResume() {
+        setTimeout(() => {
+            const video = findVideo();
+            if (video && video.paused) {
+                note('player still paused after the ad; starting it again');
+                resumePlayer();
+            }
+        }, 8000);
+    }
+
+    // Cheap lookup of the stream's <video>, safe to call every second (unlike findMediaPlayer).
     function findVideo() {
         const videos = [...document.querySelectorAll('.video-player video'), ...document.getElementsByTagName('video')];
-        return videos.find((video) => !isAdVideo(video)) || null;
+        return videos.find((video) => !isAdVideo(video) && video.dataset.twitchAdblockHq !== 'ad') || null;
     }
 
     // Twitch also plays ads outside the stream: separate <video> ads beside the player and in chat, served from the
@@ -1258,21 +1330,29 @@
         for (const video of document.getElementsByTagName('video')) {
             const marked = video.dataset.twitchAdblockHq === 'ad';
             if (isAdVideo(video)) {
-                if (!marked) {
+                const src = video.currentSrc || video.getAttribute('src');
+                if (!marked || video.dataset.twitchAdblockHqSrc !== src) {
+                    if (!marked) video.dataset.twitchAdblockHqMuted = String(video.muted);
                     video.dataset.twitchAdblockHq = 'ad';
-                    video.dataset.twitchAdblockHqMuted = String(video.muted);
-                    if (settings.debug) console.log('[TwitchAdBlockHQ] hiding a separate video ad');
+                    video.dataset.twitchAdblockHqSrc = src;
+                    video.dataset.twitchAdblockHqPauses = '0';
+                    note('hiding a separate video ad', { host: new URL(src, root.location.href).hostname, inPlayer: !!video.closest('.video-player') });
                 }
                 // Re-applied every time: re-renders can drop the style, and a hidden video would still play audio.
                 video.style.setProperty('display', 'none', 'important');
                 video.muted = true;
-                if (!video.paused) video.pause();
+                // Pause a few times at most, so a player that keeps restarting the ad isn't fought forever.
+                const pauses = Number(video.dataset.twitchAdblockHqPauses) || 0;
+                if (!video.paused && pauses < 3) {
+                    video.dataset.twitchAdblockHqPauses = String(pauses + 1);
+                    video.pause();
+                }
             } else if (marked) {
                 // Twitch reuses <video> elements: restore one that now plays something else.
                 video.style.removeProperty('display');
                 video.muted = video.dataset.twitchAdblockHqMuted === 'true';
-                delete video.dataset.twitchAdblockHq;
-                delete video.dataset.twitchAdblockHqMuted;
+                for (const key of ['twitchAdblockHq', 'twitchAdblockHqMuted', 'twitchAdblockHqSrc', 'twitchAdblockHqPauses']) delete video.dataset[key];
+                note('restored a reused video element');
             }
         }
         for (const element of document.querySelectorAll('[data-test-selector="sda-wrapper"]')) {
@@ -1287,6 +1367,31 @@
             }, true);
         }
         setInterval(hideDisplayAds, 1000);
+    }
+
+    // Per-second playback samples of the stream's video element, for diagnostics.
+    const samples = [];
+    function startPlaybackSampler() {
+        let previous = null;
+        setInterval(() => {
+            const video = findVideo();
+            if (!video) return;
+            const quality = typeof video.getVideoPlaybackQuality === 'function' ? video.getVideoPlaybackQuality() : null;
+            const current = { time: video.currentTime, frames: quality ? quality.totalVideoFrames : 0, dropped: quality ? quality.droppedVideoFrames : 0, at: performance.now() };
+            if (previous) {
+                const seconds = (current.at - previous.at) / 1000 || 1;
+                samples.push({
+                    at: new Date().toISOString().slice(11, 19),
+                    fps: Math.round((current.frames - previous.frames - (current.dropped - previous.dropped)) / seconds),
+                    dropped: current.dropped - previous.dropped,
+                    rate: Math.round(((current.time - previous.time) / seconds) * 100) / 100,
+                    height: video.videoHeight,
+                    paused: video.paused,
+                });
+                if (samples.length > 120) samples.shift();
+            }
+            previous = current;
+        }, 1000);
     }
 
     function renderBanner(status) {
@@ -1321,8 +1426,8 @@
         banner.style.display = 'block';
     }
 
-    // After an ad the player can get stuck: holding leaves a hole in its buffer, the player may have paused itself, and
-    // a quality change can leave the picture frozen while audio keeps playing. Watch playback for a while and fix these.
+    // After an ad without a pause, the player can get stuck: skipped time leaves a hole in its buffer, and a quality change
+    // can leave the picture frozen while audio keeps playing. Watch playback for a while and fix these gently.
     let stallWatchTimer = null;
     function scheduleStallCheck() {
         clearInterval(stallWatchTimer);
@@ -1331,7 +1436,7 @@
         let lastFrames = -1;
         let stuckSince = 0;
         let frozenSince = 0;
-        let nudges = 0;
+        let fixes = 0;
         stallWatchTimer = setInterval(() => {
             const video = findVideo();
             if (!video || Date.now() - startedAt > 30000) {
@@ -1343,55 +1448,133 @@
                 for (let i = 0; i < video.buffered.length; i++) {
                     const start = video.buffered.start(i);
                     if (start > time && start - time < 60) {
-                        if (settings.debug) console.log(`[TwitchAdBlockHQ] skipping ${(start - time).toFixed(1)}s buffer gap left by the ad`);
+                        note('skipping buffer gap left by the ad', { seconds: Math.round((start - time) * 10) / 10 });
                         video.currentTime = start + 0.05;
                         return;
                     }
                 }
             }
-            // A pause long after the ad is the viewer's choice; only undo pauses right after resuming.
-            const stuck = time === lastTime && (!video.paused || Date.now() - startedAt < 8000);
+            const stuck = time === lastTime && video.paused && Date.now() - startedAt < 8000;
             stuckSince = stuck ? stuckSince || Date.now() : 0;
             // Browsers stop decoding video in hidden tabs, so frame counts are only meaningful while visible.
             const frames = typeof video.getVideoPlaybackQuality === 'function' ? video.getVideoPlaybackQuality().totalVideoFrames : -1;
-            const frozen = !video.paused && document.visibilityState === 'visible' && time !== lastTime && frames >= 0 && frames === lastFrames;
+            const frozen = !video.paused && document.visibilityState === 'visible' && time !== lastTime && frames > 0 && frames === lastFrames;
             frozenSince = frozen ? frozenSince || Date.now() : 0;
             lastTime = time;
             lastFrames = frames;
-            if ((stuckSince || frozenSince) && Date.now() - (stuckSince || frozenSince) > 3000 && nudges < 3) {
-                nudges++;
-                if (settings.debug) console.log(`[TwitchAdBlockHQ] ${stuckSince ? 'playback stuck' : 'picture frozen'} after the ad; resuming`);
+            if (fixes >= 3) return;
+            if (stuckSince && Date.now() - stuckSince > 3000) {
+                fixes++;
                 stuckSince = 0;
+                note('player paused after the ad; starting it again');
+                resumePlayer();
+            } else if (frozenSince && Date.now() - frozenSince > 3000) {
+                fixes++;
                 frozenSince = 0;
-                const player = findMediaPlayer();
-                if (player && typeof player.play === 'function') {
-                    if (!video.paused && typeof player.pause === 'function') player.pause();
-                    player.play();
+                note('picture frozen while audio plays; resynchronising video', { attempt: fixes });
+                if (fixes === 1) {
+                    // Seeking in place makes the browser flush and resynchronise the video with the audio.
+                    video.currentTime = video.currentTime;
                 } else {
-                    video.play().catch(() => {});
+                    const player = findMediaPlayer();
+                    if (player && typeof player.pause === 'function' && typeof player.play === 'function') {
+                        player.pause();
+                        player.play();
+                    }
                 }
             }
         }, 500);
     }
 
+    // The main stream's player. Twitch can have several (e.g. a preview), so prefer the one whose video is largest on screen.
+    let cachedPlayer = null;
+    let cachedPlayerAt = 0;
     function findMediaPlayer() {
+        if (cachedPlayer && Date.now() - cachedPlayerAt < 2000) return cachedPlayer;
         const rootNode = document.querySelector('#root');
         if (!rootNode) return null;
         const containerKey = Object.keys(rootNode).find((key) => key.startsWith('__reactContainer'));
         let fiber = containerKey ? rootNode[containerKey] : rootNode._reactRootContainer && rootNode._reactRootContainer._internalRoot && rootNode._reactRootContainer._internalRoot.current;
         const stack = fiber ? [fiber] : [];
+        const candidates = [];
         let visited = 0;
         while (stack.length && visited++ < 50000) {
             fiber = stack.pop();
             const node = fiber.stateNode;
             if (node && node.setPlayerActive && node.props && node.props.mediaPlayerInstance) {
                 const instance = node.props.mediaPlayerInstance;
-                return instance.playerInstance || instance;
+                const player = instance.playerInstance || instance;
+                if (!candidates.includes(player)) candidates.push(player);
             }
             if (fiber.sibling) stack.push(fiber.sibling);
             if (fiber.child) stack.push(fiber.child);
         }
-        return null;
+        const area = (player) => {
+            try {
+                const video = typeof player.getHTMLVideoElement === 'function' ? player.getHTMLVideoElement() : null;
+                return video && video.isConnected ? video.clientWidth * video.clientHeight : 0;
+            } catch (err) {
+                return 0;
+            }
+        };
+        candidates.sort((a, b) => area(b) - area(a));
+        cachedPlayer = candidates[0] || null;
+        cachedPlayerAt = Date.now();
+        return cachedPlayer;
+    }
+
+    function diagnostics() {
+        const player = findMediaPlayer();
+        let own = findVideo();
+        try {
+            own = (player && typeof player.getHTMLVideoElement === 'function' && player.getHTMLVideoElement()) || own;
+        } catch (err) {
+            // keep the DOM lookup
+        }
+        const videos = [...document.getElementsByTagName('video')].map((video) => {
+            const src = video.currentSrc || video.getAttribute('src') || '';
+            const quality = typeof video.getVideoPlaybackQuality === 'function' ? video.getVideoPlaybackQuality() : {};
+            let host = src;
+            try {
+                host = src.startsWith('blob:') ? 'blob' : src ? new URL(src, root.location.href).hostname : '';
+            } catch (err) {
+                // keep the raw value
+            }
+            return {
+                stream: video === own,
+                src: host,
+                display: getComputedStyle(video).display,
+                size: `${video.clientWidth}x${video.clientHeight}`,
+                decoded: `${video.videoWidth}x${video.videoHeight}`,
+                paused: video.paused,
+                muted: video.muted,
+                readyState: video.readyState,
+                time: Math.round(video.currentTime * 10) / 10,
+                frames: quality.totalVideoFrames,
+                dropped: quality.droppedVideoFrames,
+                hiddenAsAd: video.dataset.twitchAdblockHq === 'ad',
+            };
+        });
+        let playerState = null;
+        try {
+            playerState = player ? { state: typeof player.getState === 'function' ? player.getState() : null, quality: readQuality(player) } : null;
+        } catch (err) {
+            playerState = { error: String(err) };
+        }
+        const playerElement = document.querySelector('.video-player');
+        const report = {
+            version: VERSION,
+            browser: navigator.userAgent,
+            settings,
+            status: lastStatus,
+            player: playerState,
+            offlineShown: !!playerElement && playerElement.innerText.includes('OFFLINE'),
+            videos,
+            playbackLastMinute: samples.slice(-60).map((s) => `${s.at} ${s.fps}fps dropped:${s.dropped} speed:${s.rate} ${s.height}p${s.paused ? ' paused' : ''}`),
+            events: events.slice(-60),
+        };
+        console.log(`[TwitchAdBlockHQ] diagnostics\n${JSON.stringify(report, null, 1)}`);
+        return report;
     }
 
     function exposeApi() {
@@ -1419,6 +1602,8 @@
                 return Object.assign({}, settings);
             },
             status: () => lastStatus,
+            // Snapshot of playback, video elements and recent actions, for bug reports.
+            diagnostics,
             // Pretend the player's session shows an ad. includeBackups also pretends full quality backups do.
             simulateAd(seconds = 60, includeBackups = false) {
                 broadcast({ type: 'simulate-ad', seconds, includeBackups });
@@ -1429,6 +1614,7 @@
     hookFetch();
     hookWorker();
     startDisplayAdGuard();
+    startPlaybackSampler();
     exposeApi();
     console.log(`[TwitchAdBlockHQ] v${VERSION} active (fallback: ${settings.fallbackMode})`);
     if (settings.debug) console.log('[TwitchAdBlockHQ] settings', JSON.stringify(settings));
