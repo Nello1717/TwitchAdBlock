@@ -4,7 +4,8 @@ A userscript that blocks Twitch ads **without dropping the stream to low quality
 
 Existing script-based blockers (e.g. [TwitchAdSolutions](https://github.com/pixeltris/TwitchAdSolutions) `vaft` /
 `video-swap-new`) replace the ad with a backup stream that is usually 360p, and often keep showing it for a while after
-the ad has ended. This script only ever plays the quality you selected, and never reloads the player.
+the ad has ended. This script keeps playing the quality you selected through the ad break whenever any Twitch session
+offers it ad-free, and returns to it the moment one does.
 
 ## Install
 
@@ -22,7 +23,7 @@ On Chromium browsers with Manifest V3 userscript managers, enable *Allow user sc
 4. Restart the browser.
 
 uBlock Origin keeps its downloaded copy of the script until the address changes; restarting or "Update now" doesn't
-refresh it. To get a new version, add or change a version suffix at the end of the address, e.g. `...ublock-origin.js?v=1.1.3`,
+refresh it. To get a new version, add or change a version suffix at the end of the address, e.g. `...ublock-origin.js?v=1.2.0`,
 and click *Apply changes*.
 
 Don't combine it with other Twitch-specific ad blockers.
@@ -60,18 +61,23 @@ These observations come from live twitch.tv playlists (September 2026):
 3. When your session shows an ad, the script opens backup sessions in parallel (`site`, `popout`, `mobile_web`, `embed` by default).
    It uses the one that is ad-free **at exactly your rendition**: same resolution, frame rate, codec and bitrate. A
    backup with its own preroll is kept alive until that preroll finishes, then used for the rest of the ad break.
+   With `keepBackupsWarm` (default), the backups are opened ~15 seconds after the stream starts and checked every
+   10 seconds while you watch, so their own prerolls are already over and a full-quality backup is ready the moment
+   an ad break starts.
 4. Live segments from your session and the backups are merged into **one continuous playlist**, aligned by the
    channel-wide sequence number. The player never sees an ad segment, a sequence jump or a duplicate segment. It keeps
    playing, so there is no reload, no black screen and no quality ramp-up.
 5. When your session is ad-free again, playback switches back seamlessly.
 6. If no ad-free stream at your quality exists yet (e.g. every session is in the same midroll), the `fallbackMode`
    setting decides what happens:
-   - `hold` (default): never lower the quality. The player waits behind a notice while the script keeps checking.
-     As soon as your session or a backup is ad-free at your quality, playback continues at the live edge.
-     Twitch's player sometimes stays stopped after such a wait, behind its OFFLINE screen. The script notices, starts
-     it again and, if that doesn't help within about 12 seconds, reloads the player on the same session (no new ad).
-   - `lowres`: show the best lower-quality ad-free stream (usually 360p). Switch back to your quality the moment
-     any session offers it ad-free.
+   - `lowres` (default): show the best lower-quality ad-free stream (usually 360p) for that gap. Switch back to your
+     quality the moment any session offers it ad-free. With warm backups this gap is usually short or absent.
+   - `hold`: never lower the quality. The picture stops behind an *Ad break blocked* overlay with a timer while the
+     script keeps checking. As soon as your session or a backup is ad-free at your quality, playback continues at the
+     live edge. Twitch's player often stops itself during such a wait and can stay stuck behind its OFFLINE screen, so
+     when the wait ends the script reloads the player on the same, now ad-free session (no new ad). If playback stops
+     at another time within 10 minutes of an ad, it starts the player again and, if that doesn't help within about 12
+     seconds, reloads it. A *Resuming the stream…* overlay covers the player meanwhile.
 
 Tested live against twitch.tv. With a real preroll on the player's session, the stream started on time and played the
 whole ad break at full quality from a backup session. It then switched back to the player's session without a stall.
@@ -89,26 +95,30 @@ Ads rendered inside cross-origin iframes can't be reached from a userscript.
 Settings are stored in `localStorage` and changed from the browser console on twitch.tv:
 
 ```js
-twitchAdBlockHQ.setSettings({ fallbackMode: 'lowres' })
+twitchAdBlockHQ.setSettings({ fallbackMode: 'hold' })
 twitchAdBlockHQ.getSettings()
 twitchAdBlockHQ.resetSettings()
 ```
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `fallbackMode` | `'hold'` | `'hold'` never lowers quality. `'lowres'` temporarily shows a lower-quality ad-free stream. |
+| `fallbackMode` | `'lowres'` | `'lowres'` briefly shows a lower-quality ad-free stream when no full-quality one is available yet. `'hold'` never lowers quality and waits instead. |
 | `minFallbackHeight` | `0` | `lowres` only: never show a fallback below this height (e.g. `480`). |
 | `pauseDuringHold` | `false` | `hold` only: pause the player while waiting instead of showing a loading spinner. Can leave the video stuttering after the ad (seen in Opera GX), so it's off by default. |
 | `resumeAtLiveEdge` | `true` | `hold` only: after waiting more than a few seconds, continue at the live edge. `false` continues where playback stopped when that part is still available (up to ~30 s), adding delay. |
+| `keepBackupsWarm` | `true` | Keep backup sessions open and checked while you watch, so they are ad-free when an ad break starts. `false` opens them only when an ad starts and closes them 30 s after it ends. |
 | `backupPlayerTypes` | `['site', 'popout', 'mobile_web', 'embed']` | Player types used for full-quality backup sessions (`'type'` or `'type/platform'`). All are opened in parallel; the order only breaks ties. |
 | `fallbackPlayerTypes` | `['autoplay/android']` | Player types used for the `lowres` fallback. |
 | `forcePlayerType` | `'popout'` | Player type requested for your own session instead of `site` (`null` = unchanged). |
 | `hideDisplayAds` | `true` | Hide, mute and pause separate video ads and stream display ads (see above). |
-| `showBanner` | `true` | Show a small notice on the player while an ad is blocked. |
+| `showBanner` | `true` | Show a small notice on the player while an ad is blocked, and the overlay while the picture waits for an ad-free stream or the player is being restarted. |
 | `debug` | `false` | Log decisions to the console (page and worker), including client-side ad requests. |
 | `tuning` | `{}` | Advanced: override timing values from `TUNING` in the script, e.g. `{ sessionWaitMs: 2000 }`. Unknown keys and invalid numbers are ignored. |
 
-Changes apply immediately, except `debug`, which needs a page reload to log client-side ad requests.
+Changes apply immediately, except `debug`, which needs a page reload to log client-side ad requests. Only settings
+that differ from the defaults are saved, so later versions can improve the defaults. Settings that version 1.1.3 or
+earlier saved in full are converted once: values that were defaults back then (such as `fallbackMode: 'hold'`) are
+dropped, so the new defaults apply.
 
 ## Limitations
 
@@ -117,8 +127,8 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 - While `hold` waits, Twitch's automatic quality selection may step down; it recovers after the ad. Choosing a
   fixed quality in the player avoids this.
 - A player type that keeps failing (Twitch sometimes answers token requests for `embed` with a GQL "server error")
-  is retried with increasing delays, up to once a minute. Backup sessions are kept for 30 seconds after an ad in case
-  ad markers come back.
+  is retried with increasing delays, up to once a minute. Warm backup sessions are renewed about every 10 minutes;
+  each one costs a small playlist request every 10 seconds (no video is downloaded until it is used).
 - Behaviour in background tabs has not been tested as thoroughly as in visible tabs.
 - 1440p and 4K renditions require being logged in (Twitch restricts them for anonymous viewers). Backup sessions
   reuse your login, so they get the same renditions as your player.
@@ -128,7 +138,7 @@ Changes apply immediately, except `debug`, which needs a page reload to log clie
 
 ## Troubleshooting
 
-- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.1.3 active`. With `debug: true` it also logs
+- **Is it running?** The console should show `[TwitchAdBlockHQ] v1.2.0 active`. With `debug: true` it also logs
   `worker hooks installed` when a stream loads.
 - **Try the ad path without waiting for an ad:** `twitchAdBlockHQ.simulateAd(30)` pretends your session shows a
   30-second ad. `twitchAdBlockHQ.simulateAd(30, true)` pretends full-quality backups do too, which exercises

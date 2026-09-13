@@ -18,14 +18,15 @@ twitch-videoad.js text/javascript
 (function (root) {
     'use strict';
     if (/(^|\.)twitch\.tv$/.test(document.location.hostname) === false) { return; }
-    const VERSION = '1.1.3';
+    const VERSION = '1.2.0';
     const MESSAGE_TAG = '__twitchAdBlockHQ';
     const SETTINGS_STORAGE_KEY = 'twitchAdBlockHQ.settings';
     const DEFAULT_SETTINGS = {
         // What to play while the player's session shows an ad and no ad-free stream at your quality exists yet:
+        //   'lowres' - keep playing: show the best lower quality ad-free stream (usually 360p) for that short gap and
+        //              switch back to your quality as soon as any session offers it ad-free
         //   'hold'   - never lower the quality; the player waits until an ad-free stream at your quality is available
-        //   'lowres' - show the best lower quality ad-free stream (usually 360p) until your quality is available again
-        fallbackMode: 'hold',
+        fallbackMode: 'lowres',
         // 'lowres' only: never show a fallback stream below this height in pixels (0 = no limit).
         minFallbackHeight: 0,
         // 'hold' only: pause the player while waiting, instead of showing a loading spinner. Off by default: restarting
@@ -34,6 +35,9 @@ twitch-videoad.js text/javascript
         // 'hold' only: after a long wait, continue at the live edge (like Twitch after an ad) rather than where
         // playback stopped. Continuing where it stopped keeps every second of the stream but adds delay.
         resumeAtLiveEdge: true,
+        // Keep backup sessions open between ads and check on them now and then, so any ad of their own is already over
+        // when the next ad break starts. Makes a full quality backup available right away instead of after a gap.
+        keepBackupsWarm: true,
         // Access token player types used for full quality backup sessions ('type' or 'type/platform'). All are
         // opened in parallel; the order only breaks ties.
         backupPlayerTypes: ['site', 'popout', 'mobile_web', 'embed'],
@@ -44,7 +48,7 @@ twitch-videoad.js text/javascript
         // Hide, mute and pause Twitch's separate video ads (beside the player and in chat) and stream display ads.
         // These are delivered outside the stream, so playlist handling can't remove them.
         hideDisplayAds: true,
-        // Show a small notice on the player while an ad is being blocked.
+        // Show a notice on the player while an ad is being blocked, and a clear "Ad break" screen while waiting.
         showBanner: true,
         // Log decisions to the console.
         debug: false,
@@ -59,7 +63,9 @@ twitch-videoad.js text/javascript
         sessionRetryMaxMs: 60000, // Longest delay between retries of a failing player type
         sessionLingerMs: 30000, // Keep backup sessions this long after an ad, in case ad markers come back
         sessionMaxAdMs: 90000, // Replace a backup session that has shown ads for this long
-        sessionMaxAgeMs: 600000, // Replace backup sessions older than this (access tokens expire)
+        sessionMaxAgeMs: 600000, // Replace backup sessions around this age, between ads (access tokens expire after ~20 min)
+        warmStartDelayMs: 15000, // Open warm backup sessions this long after a stream starts, so they don't slow down its start
+        warmPollMs: 10000, // How often warm backup sessions are checked between ads
         streamIdleMs: 60000, // Forget streams whose playlists have not been requested for this long
         maxTimelineSegments: 15, // Segments kept in rewritten playlists
         segmentsAfterGap: 3, // Segments added when playback resumes after skipped content (keeps latency low)
@@ -536,7 +542,7 @@ twitch-videoad.js text/javascript
             if (!variants.length) return;
             const channel = decodeURIComponent(usherUrl.pathname.split('/').pop().replace(/\.m3u8$/, '')).toLowerCase();
             const stream = {
-                id: nextId++, channel, usherUrl, variants, sessions: new Map(), failures: new Map(), cleanSince: 0,
+                id: nextId++, channel, usherUrl, variants, sessions: new Map(), failures: new Map(), cleanSince: 0, lastVariant: null, warmTimer: null,
                 sequence: Lib.createSequenceState(), lastRequestAt: now(), adActive: false, statusKey: null,
             };
             streams.set(stream.id, stream);
@@ -593,6 +599,8 @@ twitch-videoad.js text/javascript
         }
         async function processMediaPlaylist(entry, text) {
             const { stream, variant, timeline } = entry;
+            stream.lastVariant = variant;
+            keepSessionsWarm(stream);
             const simulating = simulation.until > now();
             const main = Lib.parseMedia(text, entry.memo);
             Lib.rememberSequence(entry.memo, main);
@@ -697,10 +705,11 @@ twitch-videoad.js text/javascript
                 const failure = stream.failures.get(candidate.key);
                 // A player type that keeps failing (e.g. GQL "server error") is retried less and less often.
                 const coolingDown = failure && time - failure.at < Math.min(tuning.sessionRetryMs * 2 ** (failure.count - 1), tuning.sessionRetryMaxMs);
+                // Warm sessions are renewed gracefully before this; this only replaces sessions close to token expiry.
                 const replace = !session
                     || session.state === 'failed'
                     || (session.adSince && time - session.adSince > tuning.sessionMaxAdMs)
-                    || time - session.createdAt > tuning.sessionMaxAgeMs;
+                    || time - session.createdAt > tuning.sessionMaxAgeMs * 1.8;
                 if (replace && !coolingDown) {
                     stream.sessions.set(candidate.key, openSession(stream, candidate));
                 }
@@ -716,15 +725,62 @@ twitch-videoad.js text/javascript
         }
         // Backup sessions are kept for a while after an ad: Twitch sometimes shows ad markers again moments later.
         function releaseIdleSessions(stream) {
-            if (!stream.sessions.size) return;
+            if (settings.keepBackupsWarm || !stream.sessions.size) return;
             if (!stream.cleanSince) {
                 stream.cleanSince = now();
             } else if (now() - stream.cleanSince >= tuning.sessionLingerMs) {
                 stream.sessions.clear();
             }
         }
+        // Between ads, keep backup sessions open and look at them now and then: any ad of their own runs out in the
+        // meantime, so a full quality backup is ready the moment the player's session shows an ad.
+        function keepSessionsWarm(stream) {
+            if (!settings.keepBackupsWarm || stream.warmTimer) return;
+            const startAt = now() + tuning.warmStartDelayMs;
+            stream.warmTimer = setInterval(() => {
+                if (!streams.has(stream.id) || !settings.keepBackupsWarm || now() - stream.lastRequestAt > tuning.streamIdleMs) {
+                    clearInterval(stream.warmTimer);
+                    stream.warmTimer = null;
+                    return;
+                }
+                if (now() < startAt || stream.adActive || stream.warming) return;
+                stream.warming = true;
+                warmSessions(stream)
+                    .catch((err) => log('keeping backup sessions warm failed', err))
+                    .then(() => { stream.warming = false; });
+            }, tuning.warmPollMs);
+            if (typeof stream.warmTimer.unref === 'function') stream.warmTimer.unref();
+        }
+        async function warmSessions(stream) {
+            ensureSessions(stream);
+            const target = stream.lastVariant;
+            if (!target) return;
+            const polls = [];
+            for (const [key, session] of stream.sessions) {
+                if (session.successor && session.successor.state === 'failed') session.successor = null;
+                // Renew before the access token expires. The old session stays in use until its successor is ad-free.
+                if (session.state === 'ready' && !session.successor && now() - session.createdAt > session.renewAfterMs) {
+                    session.successor = openSession(stream, session.candidate);
+                }
+                for (const current of [session, session.successor]) {
+                    if (!current || current.state !== 'ready') continue;
+                    const match = Lib.matchVariant(current.variants, target);
+                    if (match) polls.push(pollSession(stream, current, match).then((result) => ({ key, current, result })));
+                }
+            }
+            for (const { key, current, result } of await Promise.all(polls)) {
+                const session = stream.sessions.get(key);
+                if (session && session.successor === current && result && !result.showingAd && result.newest) {
+                    stream.sessions.set(key, current);
+                    log(`backup ${key} renewed`);
+                }
+            }
+        }
         function openSession(stream, candidate) {
-            const session = Object.assign({ state: 'opening', createdAt: now(), variants: [], memos: new Map(), adSince: null }, candidate);
+            const session = Object.assign({
+                state: 'opening', createdAt: now(), variants: [], memos: new Map(), adSince: null, candidate,
+                renewAfterMs: tuning.sessionMaxAgeMs * (0.8 + Math.random() * 0.4),
+            }, candidate);
             session.ready = (async () => {
                 const token = await requestAccessToken(stream.channel, candidate.playerType, candidate.platform);
                 const usherUrl = new URL(stream.usherUrl.href);
@@ -876,10 +932,25 @@ twitch-videoad.js text/javascript
     function loadSettings() {
         try {
             const stored = JSON.parse(root.localStorage.getItem(SETTINGS_STORAGE_KEY) || '{}');
-            return sanitizeSettings(Object.assign({}, DEFAULT_SETTINGS, stored));
+            const migrated = migrateLegacySettings(stored);
+            const loaded = sanitizeSettings(Object.assign({}, DEFAULT_SETTINGS, migrated || stored));
+            if (migrated) saveSettings(loaded);
+            return loaded;
         } catch (err) {
             return Object.assign({}, DEFAULT_SETTINGS);
         }
+    }
+    // Up to version 1.1.3 every setting was stored, which would keep the defaults of that time forever. Such a full copy
+    // has every setting those versions knew; values that were defaults back then are dropped, once.
+    function migrateLegacySettings(stored) {
+        const legacyKeys = ['fallbackMode', 'minFallbackHeight', 'backupPlayerTypes', 'fallbackPlayerTypes', 'forcePlayerType', 'showBanner', 'debug'];
+        const legacyDefaults = { fallbackMode: ['hold'], pauseDuringHold: [true, false], backupPlayerTypes: [['embed', 'site', 'popout']] };
+        if (!legacyKeys.every((key) => key in stored)) return null;
+        const result = Object.assign({}, stored);
+        for (const [key, values] of Object.entries(legacyDefaults)) {
+            if (values.some((value) => JSON.stringify(value) === JSON.stringify(result[key]))) delete result[key];
+        }
+        return result;
     }
     function effectiveTuning() {
         return Object.assign({}, TUNING, settings.tuning);
@@ -891,7 +962,7 @@ twitch-videoad.js text/javascript
         if (Array.isArray(value.backupPlayerTypes)) result.backupPlayerTypes = value.backupPlayerTypes.map(String).filter(Boolean);
         if (Array.isArray(value.fallbackPlayerTypes)) result.fallbackPlayerTypes = value.fallbackPlayerTypes.map(String).filter(Boolean);
         if (value.forcePlayerType === null || typeof value.forcePlayerType === 'string') result.forcePlayerType = value.forcePlayerType || null;
-        for (const key of ['pauseDuringHold', 'resumeAtLiveEdge', 'hideDisplayAds', 'showBanner', 'debug']) {
+        for (const key of ['pauseDuringHold', 'resumeAtLiveEdge', 'keepBackupsWarm', 'hideDisplayAds', 'showBanner', 'debug']) {
             if (typeof value[key] === 'boolean') result[key] = value[key];
         }
         result.tuning = {};
@@ -899,6 +970,22 @@ twitch-videoad.js text/javascript
             if (Object.prototype.hasOwnProperty.call(TUNING, key) && Number.isFinite(number) && number >= 0) result.tuning[key] = number;
         }
         return result;
+    }
+    // Only settings that differ from the defaults are stored, so improved defaults reach everyone else.
+    function saveSettings(value = settings) {
+        const changed = {};
+        for (const [key, defaultValue] of Object.entries(DEFAULT_SETTINGS)) {
+            if (JSON.stringify(value[key]) !== JSON.stringify(defaultValue)) changed[key] = value[key];
+        }
+        try {
+            if (Object.keys(changed).length) {
+                root.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(changed));
+            } else {
+                root.localStorage.removeItem(SETTINGS_STORAGE_KEY);
+            }
+        } catch (err) {
+            console.warn('[TwitchAdBlockHQ] could not save settings', err);
+        }
     }
     function broadcast(message) {
         for (const worker of workers) {
@@ -1117,6 +1204,12 @@ twitch-videoad.js text/javascript
         if (status.adActive) {
             armPlaybackRecovery();
         }
+        if (status.adActive && status.mode === 'hold') {
+            // Keep naming the quality being watched, not the one automatic quality steps down to while starved.
+            showWaitOverlay('hold', waitOverlay.reason === 'hold' && waitOverlay.detail ? waitOverlay.detail : status.quality);
+        } else if (waitOverlay.reason === 'hold') {
+            showWaitOverlay('resuming', 'The ad is over');
+        }
         if (status.mode === 'hold') {
             if (!hold) {
                 const video = findVideo();
@@ -1138,7 +1231,15 @@ twitch-videoad.js text/javascript
             const ended = hold;
             clearTimeout(ended.timer);
             hold = null;
-            if (ended.wasPlaying || ended.startup) {
+            const video = findVideo();
+            if (ended.wasPlaying && !ended.paused && video && video.paused && !recovery.viewerPaused && reloadPlayer('the player stopped while waiting for the ad', false)) {
+                // A player that ran dry and stopped itself tends to stay stuck (OFFLINE screen) or stop again after
+                // play(): reloading it on the same, now ad-free session is the quickest way back.
+                recovery.reloads++;
+                recovery.lastReloadAt = Date.now();
+                recovery.lastProgressAt = Date.now();
+                restoreQuality(ended.quality);
+            } else if (ended.wasPlaying || ended.startup) {
                 note('resuming playback', { quality: ended.quality });
                 resumePlayer();
                 if (ended.paused) {
@@ -1298,7 +1399,7 @@ twitch-videoad.js text/javascript
     function renderBanner(status) {
         const player = document.querySelector('.video-player');
         let banner = document.querySelector('.twitch-adblock-hq-banner');
-        const visible = settings.showBanner && status && status.adActive && !!player;
+        const visible = settings.showBanner && status && status.adActive && !!player && !waitOverlay.visible;
         if (!visible) {
             if (banner) banner.style.display = 'none';
             return;
@@ -1325,6 +1426,97 @@ twitch-videoad.js text/javascript
         }
         banner.textContent = text;
         banner.style.display = 'block';
+    }
+    // Covers the player while it waits for an ad-free stream or is being restarted, so Twitch's OFFLINE screen or a
+    // frozen picture doesn't look like a crash. Only shown once the picture has actually stopped; clicks go through.
+    const waitOverlay = { reason: null, detail: '', since: 0, element: null, timer: null, video: null, lastTime: -1, lastProgressAt: 0, visible: false };
+    function showWaitOverlay(reason, detail) {
+        if (waitOverlay.reason !== reason) waitOverlay.since = Date.now();
+        waitOverlay.reason = reason;
+        waitOverlay.detail = detail || '';
+        if (!waitOverlay.timer) {
+            waitOverlay.lastProgressAt = Date.now();
+            waitOverlay.timer = setInterval(updateWaitOverlay, 500);
+        }
+        updateWaitOverlay();
+    }
+    function hideWaitOverlay() {
+        clearInterval(waitOverlay.timer);
+        Object.assign(waitOverlay, { reason: null, timer: null, video: null, lastTime: -1 });
+        setWaitOverlayVisible(false);
+    }
+    function updateWaitOverlay() {
+        const now = Date.now();
+        const video = findVideo();
+        // A new video element (after a reload) starts from its own time: only count progress on the same element.
+        if (video && video === waitOverlay.video && !video.paused && video.readyState >= 3 && video.currentTime !== waitOverlay.lastTime) {
+            waitOverlay.lastProgressAt = now;
+        }
+        waitOverlay.video = video;
+        waitOverlay.lastTime = video ? video.currentTime : -1;
+        const stopped = (!!video && video.paused) || now - waitOverlay.lastProgressAt >= 1000;
+        if (waitOverlay.reason === 'resuming' && ((!stopped && now - waitOverlay.since >= 1000) || now - waitOverlay.since > 45000)) {
+            hideWaitOverlay();
+            return;
+        }
+        if (!settings.showBanner || !stopped || recovery.viewerPaused) {
+            setWaitOverlayVisible(false);
+            return;
+        }
+        const seconds = Math.floor((now - waitOverlay.since) / 1000);
+        const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+        if (waitOverlay.reason === 'hold') {
+            setWaitOverlayVisible(true, 'Ad break blocked', `Waiting for an ad-free ${[waitOverlay.detail, 'stream'].filter(Boolean).join(' ')} · ${elapsed}`);
+        } else {
+            setWaitOverlayVisible(true, 'Resuming the stream…', waitOverlay.detail);
+        }
+    }
+    function setWaitOverlayVisible(visible, title, detail) {
+        const player = document.querySelector('.video-player');
+        let element = waitOverlay.element;
+        if (!visible || !player) {
+            if (element) element.style.display = 'none';
+            if (waitOverlay.visible) {
+                waitOverlay.visible = false;
+                renderBanner(lastStatus);
+            }
+            return;
+        }
+        if (!element || element.parentElement !== player) {
+            if (element) element.remove();
+            element = document.createElement('div');
+            element.className = 'twitch-adblock-hq-overlay';
+            Object.assign(element.style, {
+                position: 'absolute', inset: '0', zIndex: '1000', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: 'rgba(14, 14, 16, 0.92)', color: '#efeff1', font: '14px/1.4 sans-serif', textAlign: 'center', pointerEvents: 'none',
+            });
+            const spinner = document.createElement('div');
+            Object.assign(spinner.style, {
+                width: '36px', height: '36px', margin: '0 auto 14px', borderRadius: '50%', boxSizing: 'border-box',
+                border: '4px solid rgba(255, 255, 255, 0.2)', borderTopColor: '#a970ff',
+            });
+            if (typeof spinner.animate === 'function') {
+                spinner.animate([{ transform: 'rotate(0deg)' }, { transform: 'rotate(360deg)' }], { duration: 1000, iterations: Infinity });
+            }
+            const heading = document.createElement('div');
+            heading.className = 'twitch-adblock-hq-overlay-title';
+            Object.assign(heading.style, { fontSize: '18px', fontWeight: '600' });
+            const text = document.createElement('div');
+            text.className = 'twitch-adblock-hq-overlay-detail';
+            Object.assign(text.style, { marginTop: '4px', opacity: '0.75' });
+            const box = document.createElement('div');
+            box.append(spinner, heading, text);
+            element.appendChild(box);
+            player.appendChild(element);
+            waitOverlay.element = element;
+        }
+        element.querySelector('.twitch-adblock-hq-overlay-title').textContent = title;
+        element.querySelector('.twitch-adblock-hq-overlay-detail').textContent = detail || '';
+        element.style.display = 'flex';
+        if (!waitOverlay.visible) {
+            waitOverlay.visible = true;
+            renderBanner(lastStatus);
+        }
     }
     // After an ad without a pause, the player can get stuck: skipped time leaves a hole in its buffer, and a quality change
     // can leave the picture frozen while audio keeps playing. Watch playback for a while and fix these gently.
@@ -1438,6 +1630,7 @@ twitch-videoad.js text/javascript
             return false;
         }
         note('reloading the player', { reason, newSession: !!newSession });
+        showWaitOverlay('resuming', 'Restarting the player');
         cachedComponents = null;
         loader.setSrc({ isNewMediaPlayerInstance: true, refreshAccessToken: !!newSession });
         if (player && typeof player.play === 'function') player.play();
@@ -1492,6 +1685,7 @@ twitch-videoad.js text/javascript
         if ((stuckFor >= 4000 && recovery.plays === 0) || (stuckFor >= 8000 && recovery.plays === 1)) {
             recovery.plays++;
             note('playback stopped; starting the player again', { stuckSeconds: Math.round(stuckFor / 1000) });
+            showWaitOverlay('resuming', waitOverlay.reason === 'resuming' ? waitOverlay.detail : '');
             for (let i = 0; i < video.buffered.length; i++) {
                 const start = video.buffered.start(i);
                 if (start > video.currentTime && start - video.currentTime < 60) {
@@ -1555,6 +1749,7 @@ twitch-videoad.js text/javascript
             status: lastStatus,
             player: playerState,
             offlineShown: !!playerElement && playerElement.innerText.includes('OFFLINE'),
+            overlay: waitOverlay.reason ? { reason: waitOverlay.reason, visible: waitOverlay.visible, seconds: Math.round((Date.now() - waitOverlay.since) / 1000) } : null,
             recovery: { armed: recovery.armedUntil > Date.now(), viewerPaused: recovery.viewerPaused, reloads: recovery.reloads, reloadable: !!findPlayerComponents().loader },
             videos,
             playbackLastMinute: samples.slice(-60).map((s) => `${s.at} ${s.fps}fps dropped:${s.dropped} speed:${s.rate} ${s.height}p${s.paused ? ' paused' : ''}`),
@@ -1569,21 +1764,13 @@ twitch-videoad.js text/javascript
             getSettings: () => Object.assign({}, settings),
             setSettings(partial) {
                 settings = sanitizeSettings(Object.assign({}, settings, partial));
-                try {
-                    root.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
-                } catch (err) {
-                    console.warn('[TwitchAdBlockHQ] could not save settings', err);
-                }
+                saveSettings();
                 broadcast({ type: 'settings', value: settings });
                 return Object.assign({}, settings);
             },
             resetSettings() {
-                try {
-                    root.localStorage.removeItem(SETTINGS_STORAGE_KEY);
-                } catch (err) {
-                    // ignore
-                }
                 settings = Object.assign({}, DEFAULT_SETTINGS);
+                saveSettings();
                 broadcast({ type: 'settings', value: settings });
                 return Object.assign({}, settings);
             },

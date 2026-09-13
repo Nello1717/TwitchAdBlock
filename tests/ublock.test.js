@@ -31,14 +31,14 @@ function readUblockResources(text) {
     return resources;
 }
 
-function fakeBrowserGlobals() {
+function fakeBrowserGlobals(storage = new Map()) {
     const location = { hostname: 'www.twitch.tv', href: 'https://www.twitch.tv/somechannel', pathname: '/somechannel' };
     const noop = () => {};
     const sandbox = {
         console: { log: noop, warn: noop, error: noop },
         location,
         document: { location, addEventListener: noop, querySelector: () => null, querySelectorAll: () => [], getElementsByTagName: () => [] },
-        localStorage: { getItem: () => null, setItem: noop, removeItem: noop },
+        localStorage: { getItem: (key) => (storage.has(key) ? storage.get(key) : null), setItem: (key, value) => storage.set(key, String(value)), removeItem: (key) => storage.delete(key) },
         fetch: async () => ({}),
         Worker: class Worker {},
         XMLHttpRequest: class XMLHttpRequest { open() {} },
@@ -68,7 +68,33 @@ test('the uBlock Origin resource installs its hooks on twitch.tv', () => {
     const context = fakeBrowserGlobals();
     vm.runInContext(script, context);
     assert.equal(typeof context.twitchAdBlockHQ, 'object', 'console API exposed');
-    assert.equal(context.twitchAdBlockHQ.getSettings().fallbackMode, 'hold');
+    assert.equal(context.twitchAdBlockHQ.getSettings().fallbackMode, 'lowres');
     assert.equal(context.Worker.name, 'Worker');
     assert.match(String(context.fetch), /\[native code\]/, 'fetch is hooked');
+});
+
+test('settings stored in full by version 1.1.3 or earlier pick up new defaults and keep chosen values', () => {
+    const script = readUblockResources(fs.readFileSync(FILE, 'utf8')).get('twitch-videoad.js');
+    const KEY = 'twitchAdBlockHQ.settings';
+    const legacy = {
+        fallbackMode: 'hold', minFallbackHeight: 0, pauseDuringHold: false, resumeAtLiveEdge: true,
+        backupPlayerTypes: ['site', 'popout', 'mobile_web', 'embed'], fallbackPlayerTypes: ['autoplay/android'],
+        forcePlayerType: 'popout', hideDisplayAds: true, showBanner: false, debug: false, tuning: {},
+    };
+    const storage = new Map([[KEY, JSON.stringify(legacy)]]);
+    let context = fakeBrowserGlobals(storage);
+    vm.runInContext(script, context);
+    assert.equal(context.twitchAdBlockHQ.getSettings().fallbackMode, 'lowres', 'old default replaced');
+    assert.equal(context.twitchAdBlockHQ.getSettings().showBanner, false, 'chosen value kept');
+    assert.deepEqual(JSON.parse(storage.get(KEY)), { showBanner: false }, 'only changed settings stay stored');
+
+    // Settings saved by newer versions only hold what the viewer changed, and are never migrated.
+    storage.set(KEY, JSON.stringify({ fallbackMode: 'hold' }));
+    context = fakeBrowserGlobals(storage);
+    vm.runInContext(script, context);
+    assert.equal(context.twitchAdBlockHQ.getSettings().fallbackMode, 'hold');
+    context.twitchAdBlockHQ.setSettings({ debug: true });
+    assert.deepEqual(JSON.parse(storage.get(KEY)), { fallbackMode: 'hold', debug: true });
+    context.twitchAdBlockHQ.resetSettings();
+    assert.equal(storage.has(KEY), false);
 });

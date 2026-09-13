@@ -235,6 +235,48 @@ test('backup sessions are reused when an ad follows shortly after another', asyn
     assertPlayerView(harness.outputs);
 });
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('warm backups: a full quality backup is ready the moment an ad starts', async () => {
+    // Every full quality backup session starts with its own short preroll; the player's session gets a midroll later.
+    const plan = (playerType, n) => (n === 1 ? { midrolls: [{ start: 1012, length: 6 }] } : playerType === 'autoplay' ? {} : { preroll: 4 });
+    const run = async (settings) => {
+        const harness = createHarness(plan, Object.assign({ fallbackMode: 'lowres' }, settings), { warmStartDelayMs: 0, warmPollMs: 10 });
+        const [source] = await harness.openStream();
+        for (let i = 0; i < 22; i++) {
+            await harness.refresh(source.url);
+            await sleep(25);
+        }
+        assertPlayerView(harness.outputs);
+        return harness;
+    };
+
+    const warm = await run({ keepBackupsWarm: true });
+    const warmModes = warm.statuses.filter((s) => s.adActive).map((s) => s.mode);
+    assert.equal(warmModes[0], 'backup', `full quality from the first ad refresh: ${warmModes}`);
+    assert.ok(!warmModes.includes('lowres') && !warmModes.includes('hold'));
+    assert.ok(warm.twitch.sessionCount <= 1 + 5, 'warm sessions are not reopened over and over');
+
+    const cold = await run({ keepBackupsWarm: false });
+    const coldModes = cold.statuses.filter((s) => s.adActive).map((s) => s.mode);
+    assert.equal(coldModes[0], 'lowres', `without warm sessions the ad starts on the fallback: ${coldModes}`);
+    assert.ok(coldModes.includes('backup'), 'and switches to full quality once a backup is ad-free');
+});
+
+test('warm backups are renewed without losing an ad-free backup', async () => {
+    const plan = (playerType, n) => (n === 1 ? { midrolls: [{ start: 1032, length: 5 }] } : playerType === 'autoplay' ? {} : { preroll: 3 });
+    const harness = createHarness(plan, { fallbackMode: 'lowres' }, { warmStartDelayMs: 0, warmPollMs: 10, sessionMaxAgeMs: 250 });
+    const [source] = await harness.openStream();
+    for (let i = 0; i < 40; i++) {
+        await harness.refresh(source.url);
+        await sleep(25);
+    }
+    assert.ok(harness.twitch.sessionCount > 1 + 5, 'sessions were renewed');
+    const modes = harness.statuses.filter((s) => s.adActive).map((s) => s.mode);
+    assert.equal(modes[0], 'backup', `a renewed or still-valid backup covers the ad: ${modes}`);
+    assertPlayerView(harness.outputs);
+});
+
 test('simulateAd exercises the backup path on demand', async () => {
     const harness = createHarness(() => ({}));
     const [source] = await harness.openStream();
@@ -256,5 +298,6 @@ test('failed access token requests fall back gracefully', async () => {
     for (let i = 0; i < 10; i++) await harness.refresh(source.url);
     assertPlayerView(harness.outputs);
     assert.ok(segmentsOf(harness.outputs.at(-1).text).every((uri) => uri.startsWith('1/1080p60/')), 'main session resumes after its preroll');
-    assert.equal(usherRequests, 1 + DEFAULT_SETTINGS.backupPlayerTypes.length, 'failing player types are not retried on every refresh');
+    const playerTypes = DEFAULT_SETTINGS.backupPlayerTypes.length + (DEFAULT_SETTINGS.fallbackMode === 'lowres' ? DEFAULT_SETTINGS.fallbackPlayerTypes.length : 0);
+    assert.equal(usherRequests, 1 + playerTypes, 'failing player types are not retried on every refresh');
 });
